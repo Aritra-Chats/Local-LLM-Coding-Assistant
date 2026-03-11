@@ -1,0 +1,20 @@
+# ── Core UI ───────────────────────────────────────────────────────────────────
+rich>=13.7
+prompt_toolkit>=3.0.43
+
+# ── HTTP / networking ─────────────────────────────────────────────────────────
+# Used by OllamaClient, EmbeddingClient, url_fetcher, project_synopsis
+requests>=2.31
+
+# ── Numerical / embeddings ────────────────────────────────────────────────────
+# Used by RAGEngine for cosine-similarity search over embedding vectors
+numpy>=1.26
+
+# ── System / hardware detection ───────────────────────────────────────────────
+# Used by hardware_detector.py to read CPU core count and memory stats
+psutil>=5.9
+
+# ── PDF parsing (optional) ────────────────────────────────────────────────────
+# Imported lazily via _try_import(); gracefully skipped if not installed.
+# Install to enable @pdf: attachment support.
+pdfplumber>=0.10

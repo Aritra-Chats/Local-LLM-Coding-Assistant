@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Sentinel runtime data
+.sentinel/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env

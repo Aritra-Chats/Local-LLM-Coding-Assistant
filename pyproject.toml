@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "local-llm-assistant"
+version = "0.1.0"
+description = "Sentinel — Local Autonomous Development Assistant"
+requires-python = ">=3.11"
+dependencies = [
+    "rich>=13.7",
+    "prompt_toolkit>=3.0.43",
+    "requests>=2.31",
+    "numpy>=1.26",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+pdf = ["pdfplumber>=0.10"]
+
+[project.scripts]
+sentinel = "main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agents*", "cli*", "config*", "context*", "core*",
+           "execution*", "learning*", "memory*", "models*",
+           "system*", "tasks*", "tools*"]
