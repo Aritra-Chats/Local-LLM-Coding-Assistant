@@ -13,6 +13,9 @@
 :: All extra arguments are forwarded directly to main.py.
 :: ─────────────────────────────────────────────────────────────────────────────
 
+:: Capture the directory sentinel was launched FROM before we cd away.
+set "SENTINEL_PROJECT_DIR=%CD%"
+
 :: Move to the directory that contains this .bat file, then project root.
 cd /d "%~dp0"
 

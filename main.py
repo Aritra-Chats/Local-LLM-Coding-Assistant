@@ -248,7 +248,7 @@ def main() -> None:
     _print_banner()
 
     runtime = SentinelRuntime(
-        project_root=args.project or os.getcwd(),
+        project_root=args.project or os.environ.get("SENTINEL_PROJECT_DIR") or os.getcwd(),
         force_mode=args.mode,
         skip_bootstrap=args.no_bootstrap,
     )
