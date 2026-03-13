@@ -177,12 +177,13 @@ python main.py --mode standard    # force standard models
 python main.py --mode advanced    # force advanced models
 ```
 
-### Override permanently via environment variable
+### Make mode override your default
 
-In `.env`:
+There is currently no dedicated environment variable for hardware mode.
+Use a shell alias or launcher script to always start with your preferred mode:
 
-```env
-SENTINEL_HARDWARE_MODE=standard
+```bash
+python main.py --mode standard
 ```
 
 ### Alternative models
@@ -215,6 +216,9 @@ SENTINEL_EMBEDDING_MODEL=nomic-embed-text
 
 # Context window token budget (per pipeline step)
 SENTINEL_TOKEN_BUDGET=3000
+
+# Optional default project directory (used when --project is not passed)
+SENTINEL_PROJECT_DIR=C:\code\my-project
 ```
 
 ---

@@ -131,7 +131,14 @@ Rules:
 - Steps must be ordered (later steps depend on earlier ones)
 - Be specific and actionable - each step should do ONE thing
 - Use the most appropriate agent for each step
-- Available tools: read_file, write_file, search_code, run_shell, run_tests, git_diff, git_commit, web_search, install_dependency, open_application
+- Available tools: read_file, write_file, search_code, run_shell, run_tests, git_diff, git_commit,
+  web_search, install_dependency, open_application, project_initializer
+- project_initializer tool: MUST be used as the FIRST coding step for ANY brand-new project.
+  It scaffolds the project using the correct CLI (e.g. npx create-react-app, flutter create,
+  npm init, django-admin startproject, gradle init, swift package init, etc.).
+  Supported project types: react, react-ts, vite, nextjs, vue, angular, svelte,
+  node, express, fastify, python, fastapi, django, flask,
+  react-native, expo, flutter, kotlin-android, swift-ios, electron, tauri, unity, unreal, godot.
 - Return between 2 and 10 steps depending on complexity
 - No prose before or after the JSON array."""
 

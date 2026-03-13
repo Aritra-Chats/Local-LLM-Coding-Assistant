@@ -119,6 +119,18 @@ _TEMPLATES: Dict[str, List[Dict[str, Any]]] = {
             "context_hint": "project_synopsis",
         },
         {
+            "name": "initialize project scaffold",
+            "description": (
+                "If this is a brand-new project, run the appropriate project initialiser "
+                "(e.g. npx create-react-app, flutter create, npm init, django-admin startproject) "
+                "using the project_initializer tool before writing any source files for: {goal}"
+            ),
+            "agent": "coding",
+            "tools": ["project_initializer", "run_shell"],
+            "priority": "high",
+            "context_hint": "source_files",
+        },
+        {
             "name": "implement code",
             "description": "Write the source code for: {goal}",
             "agent": "coding",

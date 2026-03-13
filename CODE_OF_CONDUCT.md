@@ -60,7 +60,7 @@ representative at an online or offline event.
 
 Instances of abusive, harassing, or otherwise unacceptable behaviour may be
 reported to the community leaders responsible for enforcement at
-**sentinel-conduct@example.com** *(replace with your actual contact address)*.
+**sentinel-conduct@example.com**.
 
 All complaints will be reviewed and investigated promptly and fairly.
 

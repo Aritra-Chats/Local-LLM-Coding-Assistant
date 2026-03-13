@@ -1356,7 +1356,7 @@ class ConcreteExecutionEngine(ExecutionEngine):
                     pass  # validator unavailable
                 # ── Approve before apply ──────────────────────────────────
                 if self._require_approval and tool_name in (
-                    "write_file", "git_commit", "run_shell", "install_dependency"
+                    "write_file", "git_commit", "run_shell", "install_dependency", "project_initializer"
                 ):
                     approved = self._request_approval(tool_name, params)
                     if not approved:
@@ -1425,6 +1425,8 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 detail = f"Git commit: [bold]{params.get('message', '?')}[/bold]"
             elif tool_name == "install_dependency":
                 detail = f"Install packages: [bold]{params.get('packages', [])}[/bold]"
+            elif tool_name == "project_initializer":
+                detail = f"Init project → [bold]{params.get('project_name', '?')}[/bold] ({params.get('project_type', 'auto-detect')})"
             else:
                 detail = str(params)
             con.print(_Panel(

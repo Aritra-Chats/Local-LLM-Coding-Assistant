@@ -64,17 +64,20 @@ python -m pytest tests/ -q
 
 ## 4. Project Structure
 
-Every top-level package follows the same pattern:
+The repository is organized by subsystem (agents, context, execution, tools, etc.).
+Common conventions:
 
 ```
-package/
-├── __init__.py       Public API — exports the stable names
-├── base_X.py         Abstract base class (ABC) where applicable
-└── concrete_X.py     Concrete implementation
+subsystem/
+├── __init__.py        Public exports
+├── *_agent.py         Agent implementations (where applicable)
+├── *.py               Runtime components for that subsystem
+└── __pycache__/
 ```
 
-ABCs and their concrete implementations live in **separate files** (`base_*.py` vs
-`concrete_*.py`). Keep that boundary intact.
+Some modules use ABC + concrete patterns (for example in the agents layer), while
+others keep lightweight concrete implementations in a single module. Match the local
+pattern of the package you are editing instead of forcing a new layout.
 
 ---
 

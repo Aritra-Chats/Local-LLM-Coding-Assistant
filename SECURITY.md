@@ -37,16 +37,15 @@ and how to report vulnerabilities.
 ## 2. Outbound Network Vectors
 
 While Sentinel is local-first, two features can make outbound network requests. Both
-are **user-initiated** and can be disabled.
+are **user-initiated**.
 
 ### 2.1 `web_search` Tool
 
-The `WebSearchTool` issues HTTP GET requests to a configured search endpoint when an
-agent calls it. By default this tool is disabled until a search provider URL is set in
-`.env`.
+The `WebSearchTool` sends requests to DuckDuckGo's HTML endpoint when an agent invokes
+`web_search`.
 
 **Mitigation:**
-- Do not set `SENTINEL_SEARCH_URL` in `.env` if you want a fully air-gapped setup.
+- Do not run tasks that require web search in air-gapped environments.
 - Review the query before confirming any agent step that invokes `web_search`.
 
 ### 2.2 `@url:` Attachment Token
@@ -84,13 +83,8 @@ intentionally powerful — and therefore the highest-risk component.
 1. **Review every command** before confirming agent steps that use `run_shell`.
 2. **Run Sentinel as a non-privileged user**, never as root or Administrator.
 3. For higher-assurance environments, consider wrapping Sentinel in a container or VM.
-4. The `SENTINEL_ALLOW_SHELL` environment variable can be set to `false` to disable the
-   `run_shell` tool entirely.
-
-```bash
-# .env — disable shell execution
-SENTINEL_ALLOW_SHELL=false
-```
+4. Use OS-level controls (container, VM, restricted user, AppLocker, shell policy) if
+  you need hard guarantees that shell execution is blocked.
 
 ---
 
@@ -107,6 +101,7 @@ All Sentinel data is stored locally under `~/.sentinel/`:
 | `~/.sentinel/metrics/` | Performance metrics per session (JSON) |
 | `~/.sentinel/logs/` | Operational logs |
 | `~/.sentinel/models/` | Model metadata cache |
+| `~/.sentinel/cache/` | Context and exploration caches |
 
 **Recommendations:**
 - Apply appropriate file-system permissions to `~/.sentinel/` to restrict access to

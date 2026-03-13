@@ -7,14 +7,14 @@ Exports
 Tool classes
     ReadFileTool, WriteFileTool, SearchCodeTool, FindFilesTool, RunShellTool, RunTestsTool,
     GitDiffTool, GitCommitTool, InstallDependencyTool, WebSearchTool,
-    OpenApplicationTool
+    OpenApplicationTool, ProjectInitializerTool
 
 Registry
     ConcreteToolRegistry, ToolResult, Tool (base)
 
 Convenience
     build_default_registry() — returns a pre-populated ConcreteToolRegistry
-    with all ten built-in tools registered.
+    with all eleven built-in tools registered.
 
 Usage
 -----
@@ -42,6 +42,7 @@ from tools.git_commit import GitCommitTool
 from tools.install_dependency import InstallDependencyTool
 from tools.web_search import WebSearchTool
 from tools.open_application import OpenApplicationTool
+from tools.project_initializer import ProjectInitializerTool
 
 __all__ = [
     # Base / registry
@@ -61,6 +62,7 @@ __all__ = [
     "InstallDependencyTool",
     "WebSearchTool",
     "OpenApplicationTool",
+    "ProjectInitializerTool",
     # Factory
     "build_default_registry",
 ]
@@ -78,6 +80,7 @@ _BUILTIN_TOOLS = [
     InstallDependencyTool,
     WebSearchTool,
     OpenApplicationTool,
+    ProjectInitializerTool,
 ]
 
 

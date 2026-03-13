@@ -19,25 +19,48 @@ from agents.agent_action import AgentAction
 from agents.base_agent import BaseAgent
 
 # Tools this agent is permitted to request.
-_ALLOWED_TOOLS = frozenset({"read_file", "write_file", "search_code", "find_files", "run_shell"})
+_ALLOWED_TOOLS = frozenset({
+    "read_file", "write_file", "search_code", "find_files",
+    "run_shell", "project_initializer",
+})
 
 _SYSTEM_PROMPT = """You are a coding assistant. Given a task description and project context, \
 decide which file operations are needed and respond with a JSON array of actions. \
 Each action must be one of:
-  {"tool": "read_file",   "params": {"path": "<relative_path>"}}
-  {"tool": "search_code", "params": {"query": "<search_term>", "path": "."}}
-  {"tool": "write_file",  "params": {"path": "<relative_path>", "content": "<new_content>"}}
-  {"tool": "run_shell",   "params": {"command": "<shell_command>"}}
-  {"tool": "find_files",  "params": {"pattern": "<glob_pattern>"}}
-  {"tool": "message",     "params": {"text": "<explanation>"}}
+  {"tool": "read_file",           "params": {"path": "<relative_path>"}}
+  {"tool": "search_code",         "params": {"query": "<search_term>", "path": "."}}
+  {"tool": "write_file",          "params": {"path": "<relative_path>", "content": "<new_content>"}}
+  {"tool": "run_shell",           "params": {"command": "<shell_command>"}}
+  {"tool": "find_files",          "params": {"pattern": "<glob_pattern>"}}
+  {"tool": "project_initializer", "params": {"project_name": "<name>", "project_type": "<type>", "output_dir": "<dir>", "description": "<goal>"}}
+  {"tool": "message",             "params": {"text": "<explanation>"}}
 
-IMPORTANT FOR NEW PROJECTS: When the task is to "write the source code" or "implement code" \
-for a NEW feature or project (not editing existing files), you MUST:
-1. Generate write_file actions to CREATE all necessary files (package.json, source code, config, etc.)
-2. For Node.js/npm projects: After writing package.json, generate run_shell actions to:
-   - Run 'npm install' in the directory containing package.json
-   - Run any other necessary setup commands
-3. Do NOT just return search_code or read_file actions.
+PROJECT INITIALIZER — MANDATORY FOR BRAND-NEW PROJECTS:
+When the task involves creating a NEW project from scratch (not editing existing files), you MUST
+call project_initializer FIRST before any write_file or run_shell actions.
+
+Supported project_type values:
+  Web:     react, react-ts, vite, nextjs, vue, angular, svelte
+  Backend: node, express, fastify, python, fastapi, django, flask
+  Mobile:  react-native, expo, flutter, kotlin-android, swift-ios
+  Desktop: electron, tauri
+  Game:    unity, unreal, godot  (will return setup guidance — no CLI init possible)
+
+Leave project_type blank and fill in description to let the tool auto-detect the type.
+
+Example for a React app in /projects:
+[
+  {"tool": "project_initializer", "params": {"project_name": "my-app", "project_type": "react", "output_dir": "/projects"}},
+  {"tool": "write_file", "params": {"path": "/projects/my-app/src/App.js", "content": "..."}}
+]
+
+IMPORTANT FOR NEW PROJECTS (general rules):
+1. Always call project_initializer FIRST for brand-new projects.
+2. After initialisation, generate write_file actions to add/override source files as needed.
+3. Do NOT manually create package.json / build.gradle / pubspec.yaml for scaffolded projects —
+   the initialiser generates them. Only add them if you are NOT using the initialiser.
+4. For Node.js/npm projects NOT using project_initializer: write package.json then run 'npm install'.
+5. Do NOT just return search_code or read_file actions for new projects.
 
 Respond ONLY with a valid JSON array. No prose before or after it."""
 
@@ -217,22 +240,35 @@ class CodingAgent(BaseAgent):
             )
         elif is_implementation_task and (not rag_text or project_is_empty):
             implementation_guidance = (
-                "\n\nThis is a NEW implementation task. You must generate write_file actions "
-                "to CREATE all necessary files, then run setup commands. Think about the complete project structure:\n"
-                "1. Identify ALL files needed (e.g., package.json, source files, config files, README)\n"
-                "2. For EACH file, create a write_file action with the full file path and complete content\n"
-                "3. Use proper paths relative to project root\n"
-                "4. Generate actual working code, not placeholders\n"
-                "5. For Node.js/React projects: After writing package.json, generate run_shell actions to:\n"
-                "   - 'npm install' in the directory containing package.json (e.g., 'npm install' if cwd=client/)\n"
-                "   - Any other setup commands needed\n"
-                "Example structure:\n"
-                '[\n  {"tool": "write_file", "params": {"path": "client/package.json", "content": "..."}},\n'
-                '  {"tool": "write_file", "params": {"path": "client/src/App.js", "content": "..."}},\n'
-                '  {"tool": "write_file", "params": {"path": "server/index.js", "content": "..."}},\n'
-                '  {"tool": "write_file", "params": {"path": "public/index.html", "content": "..."}},\n'
-                '  {"tool": "run_shell", "params": {"command": "cd client && npm install"}},\n'
-                '  {"tool": "run_shell", "params": {"command": "cd server && npm install"}}\n]\n'
+                "\n\nThis is a NEW project implementation task. Follow these steps IN ORDER:\n"
+                "1. FIRST — call project_initializer with the correct project_type to scaffold the project.\n"
+                "   Supported types: react, react-ts, vite, nextjs, vue, angular, svelte,\n"
+                "   node, express, fastify, python, fastapi, django, flask,\n"
+                "   react-native, expo, flutter, kotlin-android, swift-ios, electron, tauri,\n"
+                "   unity, unreal, godot (game engines return setup guidance only).\n"
+                "2. THEN — generate write_file actions to add/override custom source files.\n"
+                "3. Do NOT manually write package.json, pubspec.yaml, or build.gradle for scaffolded projects.\n"
+                "4. Only fall back to write_file + run_shell when no supported initialiser exists.\n"
+                "\nExample — React app:\n"
+                '[\n'
+                '  {"tool": "project_initializer", "params": {"project_name": "my-app", "project_type": "react", "output_dir": "."}},\n'
+                '  {"tool": "write_file", "params": {"path": "my-app/src/App.js", "content": "..."}}\n'
+                ']\n'
+                "\nExample — Flutter app:\n"
+                '[\n'
+                '  {"tool": "project_initializer", "params": {"project_name": "my_app", "project_type": "flutter", "output_dir": "."}},\n'
+                '  {"tool": "write_file", "params": {"path": "my_app/lib/main.dart", "content": "..."}}\n'
+                ']\n'
+                "\nExample — Django backend:\n"
+                '[\n'
+                '  {"tool": "project_initializer", "params": {"project_name": "mysite", "project_type": "django", "output_dir": "."}},\n'
+                '  {"tool": "write_file", "params": {"path": "mysite/mysite/settings.py", "content": "..."}}\n'
+                ']\n'
+                "\nExample — React Native app:\n"
+                '[\n'
+                '  {"tool": "project_initializer", "params": {"project_name": "MyApp", "project_type": "react-native", "output_dir": "."}},\n'
+                '  {"tool": "write_file", "params": {"path": "MyApp/App.tsx", "content": "..."}}\n'
+                ']\n'
             )
         
         prompt = (
@@ -325,7 +361,8 @@ class CodingAgent(BaseAgent):
 # ---------------------------------------------------------------------------
 
 _TOOL_ACTIONS = frozenset({"read_file", "write_file", "search_code", "run_tests",
-                            "run_shell", "web_search", "git_diff", "git_commit"})
+                            "run_shell", "web_search", "git_diff", "git_commit",
+                            "project_initializer", "install_dependency", "find_files"})
 
 
 def _parse_llm_actions(raw: str, agent_name: str, step_id: str) -> List[AgentAction]:

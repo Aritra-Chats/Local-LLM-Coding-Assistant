@@ -53,7 +53,7 @@ local-llm-assistant/
 ├── models/       Ollama HTTP client, embedding client, model registry
 ├── system/       Hardware detection, dependency installer, Ollama manager
 ├── tasks/        Task planner, classifier, schema re-exports
-├── tools/        10 built-in tools + registry
+├── tools/        12 built-in tools + registry
 └── main.py       SentinelRuntime orchestrator + entry point
 ```
 
@@ -307,6 +307,7 @@ class Tool:
 | `ReadFileTool` | `read_file` | Read file content with optional line range |
 | `WriteFileTool` | `write_file` | Write or overwrite a file |
 | `SearchCodeTool` | `search_code` | Regex or text search across a project |
+| `FindFilesTool` | `find_files` | Find files by glob pattern |
 | `RunShellTool` | `run_shell` | Execute a shell command |
 | `RunTestsTool` | `run_tests` | Run pytest / unittest and capture output |
 | `GitDiffTool` | `git_diff` | Show uncommitted changes |
@@ -314,6 +315,7 @@ class Tool:
 | `WebSearchTool` | `web_search` | DuckDuckGo search (no API key needed) |
 | `InstallDependencyTool` | `install_dependency` | pip install a package |
 | `OpenApplicationTool` | `open_application` | Open a URL or application |
+| `ProjectInitializerTool` | `project_initializer` | Scaffold new projects using framework generators |
 
 `ConcreteToolRegistry` wraps every invocation with:
 - JSON Schema input validation
@@ -469,43 +471,28 @@ On subsequent launches, presence of `~/.sentinel/.bootstrapped` skips all steps.
 
 ## 16. Data Flow Diagram
 
-```
-┌──────────┐    prompt     ┌─────────────────┐
-│   User   │──────────────▶│  InteractiveUI  │
-└──────────┘               └────────┬────────┘
-                                    │ task string
-                                    ▼
-                           ┌─────────────────┐   parse_prompt   ┌──────────────────┐
-                           │ SentinelRuntime │─────────────────▶│ SupervisorAgent  │
-                           └────────┬────────┘                  └──────────────────┘
-                                    │ structured task
-                                    ▼
-                           ┌─────────────────┐    plan()        ┌──────────────────┐
-                           │  SentinelRuntime│─────────────────▶│   TaskPlanner    │
-                           └────────┬────────┘                  └──────────────────┘
-                                    │ ExecutionPlan
-                                    ▼
-                           ┌─────────────────┐   generate()     ┌──────────────────┐
-                           │  SentinelRuntime│─────────────────▶│ PipelineGenerator│
-                           └────────┬────────┘                  └──────────────────┘
-                                    │ Pipeline
-                                    ▼
-                           ┌─────────────────┐   optimize()     ┌──────────────────┐
-                           │  SentinelRuntime│─────────────────▶│ PipelineOptimizer│
-                           └────────┬────────┘                  └──────────────────┘
-                                    │ Pipeline (patched)
-                                    ▼
-                           ┌─────────────────┐                  ┌──────────────────┐
-                           │ ExecutionEngine │◀────────────────▶│  ContextBuilder  │
-                           │                 │                  ├──────────────────┤
-                           │  step loop      │◀────────────────▶│   ModelRouter    │
-                           │                 │                  ├──────────────────┤
-                           │                 │◀────────────────▶│  AgentRegistry   │
-                           │                 │                  ├──────────────────┤
-                           └────────┬────────┘◀────────────────▶│  ToolRegistry    │
-                                    │ PipelineRunResult          └──────────────────┘
-                                    ▼
-                           ┌─────────────────┐
-                           │PerformanceTracker│
-                           └─────────────────┘
+```mermaid
+%%{init: {'theme': 'neutral', 'flowchart': {'curve': 'linear'}}}%%
+flowchart TD
+    U[User] --> UI[InteractiveUI]
+    UI --> SR[SentinelRuntime]
+    SR --> SUP[SupervisorAgent]
+    SR --> TP[TaskPlanner]
+    SR --> PG[PipelineGenerator]
+    SR --> OPT[LearningPipelineOptimizer]
+    OPT --> EE[ExecutionEngine]
+
+    EE <--> CB[ContextBuilder]
+    EE <--> MR[ModelRouter]
+    EE <--> AR[AgentRegistry]
+    EE <--> TR[ToolRegistry]
+    EE --> PT[PerformanceTracker]
+
+    classDef runtime fill:#e8f1ff,stroke:#1f4b99,color:#0f2c63,stroke-width:1px;
+    classDef exec fill:#e9f8ef,stroke:#1f7a45,color:#0d4d2a,stroke-width:1px;
+    classDef support fill:#fff5e8,stroke:#8a5a00,color:#5a3b00,stroke-width:1px;
+
+    class SR,SUP,TP,PG,OPT runtime;
+    class EE,AR,TR exec;
+    class CB,MR,PT,UI,U support;
 ```

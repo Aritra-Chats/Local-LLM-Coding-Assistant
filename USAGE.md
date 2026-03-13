@@ -53,8 +53,8 @@ python main.py [OPTIONS]
 # New session on the current directory
 python main.py
 
-# Resume yesterday's session
-python main.py --resume ses_20260311_091532
+# Resume a previous session
+python main.py --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 
 # Assist a specific project
 python main.py --project C:\code\my-api
@@ -96,10 +96,15 @@ Press **Ctrl+C** twice (or type `/exit`) to save the session and quit.
 | Command | Description |
 |---|---|
 | `/help` | Show all available commands with descriptions |
+| `/status` | Show current session and system status |
 | `/pipeline` | Display the last pipeline as a Rich table |
+| `/models` | List available local Ollama models |
 | `/session` | Show current session ID, project, start time, and turn count |
 | `/resume <id>` | Load a saved session by ID |
 | `/context` | Show what the context engine assembled for the last step |
+| `/index` | Rebuild the project index for the current workspace |
+| `/syscheck` | Run hardware and dependency checks |
+| `/tasks` | List user tasks in the current session |
 | `/mode <mode>` | Switch hardware mode (`minimal` / `standard` / `advanced`) |
 | `/diff` | Render a syntax-highlighted diff of the last file edit |
 | `/clear` | Clear the terminal |
@@ -166,22 +171,22 @@ sentinel › First read the README, then add a docker-compose.yml that matches t
 
 ### Sessions are automatically saved
 
-Each session is saved as a JSON file under `~/.sentinel/sessions/`. The session ID is printed at startup:
+Each session is saved as a JSON file under `~/.sentinel/sessions/`. The session ID is a UUID and is printed at startup:
 
 ```
-Session ID: ses_20260312_143201
+Session ID: 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 ```
 
 ### Resume a session
 
 ```bash
-python main.py --resume ses_20260312_143201
+python main.py --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 ```
 
 Or from within the REPL:
 
 ```
-sentinel › /resume ses_20260312_143201
+sentinel › /resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 ```
 
 ### Session data
@@ -196,15 +201,15 @@ Each session stores:
 
 ## 7. Attachment System
 
-You can include file content, image descriptions, URLs, PDF text, and code snippets directly in your prompts using `@token` syntax:
+You can include file content, URLs, and PDF text directly in prompts using `@token` syntax:
 
 | Token | Example | Description |
 |---|---|---|
 | `@file:PATH` | `@file:src/main.py` | Include file contents inline |
 | `@url:URL` | `@url:https://docs.fastapi.tiangolo.com` | Fetch and include a web page |
-| `@image:PATH` | `@image:diagram.png` | Include an image (model must support vision) |
 | `@pdf:PATH` | `@pdf:spec.pdf` | Extract and include PDF text |
-| `@snippet:NAME` | `@snippet:auth_middleware` | Include a saved snippet |
+
+Image and snippet parsing helpers exist in the context package, but the runtime prompt expansion path currently guarantees `@file:`, `@url:`, and `@pdf:` handling.
 
 ### Examples
 
@@ -264,6 +269,8 @@ python main.py --mode minimal
 sentinel › /mode standard
 ```
 
+`/mode` updates the current session metadata. Restart Sentinel with `--mode` to apply the mode change to model routing.
+
 ---
 
 ## 10. Environment Variables
@@ -274,6 +281,7 @@ sentinel › /mode standard
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama API base URL |
 | `SENTINEL_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model for RAG |
 | `SENTINEL_TOKEN_BUDGET` | `3000` | Maximum context tokens per pipeline step |
+| `SENTINEL_PROJECT_DIR` | current directory | Default project root when `--project` is not passed |
 
 Set these in `.env` (copy from `.env.example`) or in your shell environment.
 
@@ -310,10 +318,10 @@ For large refactors or multi-day features, save your session ID and resume:
 ```bash
 # Day 1
 python main.py
-# note the session ID: ses_20260311_091532
+# note the session ID: 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 
 # Day 2
-python main.py --resume ses_20260311_091532
+python main.py --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 ```
 
 ### Let Sentinel self-correct

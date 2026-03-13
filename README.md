@@ -28,42 +28,28 @@ Sentinel is a fully local, autonomous AI coding assistant that runs on your own 
 
 ## Architecture Summary
 
-```
- User Prompt
-     │
-     ▼
-┌─────────────────┐
-│  Supervisor     │  Parses intent, classifies goal, orchestrates recovery
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐     ┌──────────────────┐
-│  Task Planner   │────▶│  Execution Plan  │  Subtasks + agent assignments
-└────────┬────────┘     └──────────────────┘
-         │
-         ▼
-┌─────────────────┐     ┌──────────────────┐
-│ Pipeline        │────▶│  Pipeline JSON   │  Steps, retries, concurrency
-│ Generator       │     └──────────────────┘
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐     ┌──────────────────────────────────┐
-│ Execution       │────▶│  Specialist Agents               │
-│ Engine          │     │  coding · debugging · reasoning  │
-└────────┬────────┘     │  devops · research · system      │
-         │              └──────────────────────────────────┘
-         │
-         ▼
-┌─────────────────┐     ┌──────────────────────────────────┐
-│ Tool Registry   │────▶│  Built-in Tools                  │
-│                 │     │  read_file · write_file · git    │
-└────────┬────────┘     │  run_shell · run_tests · search  │
-         │              └──────────────────────────────────┘
-         ▼
-┌─────────────────┐
-│ Learning System │  Metrics → pipeline optimisation → prompt A/B testing
-└─────────────────┘
+```mermaid
+%%{init: {'theme': 'neutral', 'flowchart': {'curve': 'basis'}}}%%
+flowchart TD
+    A[User Prompt] --> B[Supervisor]
+    B --> C[Task Planner]
+    C --> D[Execution Plan]
+    D --> E[Pipeline Generator]
+    E --> F[Execution Engine]
+    F --> G[Agent Registry]
+    F --> H[Tool Registry]
+    F --> I[Context Builder]
+    F --> J[Model Router]
+    F --> K[Learning System]
+    K --> E
+
+    classDef core fill:#e8f1ff,stroke:#1f4b99,color:#0f2c63,stroke-width:1px;
+    classDef exec fill:#e9f8ef,stroke:#1f7a45,color:#0d4d2a,stroke-width:1px;
+    classDef infra fill:#fff5e8,stroke:#8a5a00,color:#5a3b00,stroke-width:1px;
+
+    class B,C,D,E core;
+    class F,G,H exec;
+    class I,J,K infra;
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed breakdown of every subsystem.
@@ -110,7 +96,7 @@ Alternatives that work well: `deepseek-coder`, `qwen2.5-coder`, `llama3`, `phi3`
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
+git clone https://github.com/Aritra-Chats/Local-LLM-Coding-Assistant.git
 cd Local-LLM-Coding-Assistant
 
 # 2. Create and activate a virtual environment
@@ -135,7 +121,7 @@ On first launch, Sentinel will:
 3. Pull the required Ollama models (this may take several minutes)
 4. Create workspace directories under `~/.sentinel/`
 
-See [INSTALLATION.md](INSTALLATION.md) for detailed setup instructions including offline install, proxy configuration, and troubleshooting.
+See [INSTALLATION.md](INSTALLATION.md) for detailed setup instructions including offline installation and troubleshooting.
 
 ---
 
@@ -146,7 +132,7 @@ See [INSTALLATION.md](INSTALLATION.md) for detailed setup instructions including
 python main.py
 
 # Resume a previous session
-python main.py --resume ses_20260312_143201
+python main.py --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 
 # Target a specific project directory
 python main.py --project C:\code\my-api
@@ -159,7 +145,7 @@ python main.py --no-bootstrap
 
 # Windows launcher
 sentinel.bat
-sentinel.bat --resume ses_20260312_143201
+sentinel.bat --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 ```
 
 ### Slash commands inside the REPL
@@ -167,10 +153,15 @@ sentinel.bat --resume ses_20260312_143201
 | Command | Description |
 |---|---|
 | `/help` | List all available commands |
+| `/status` | Show current session and system status |
 | `/pipeline` | Show the current pipeline as a table |
+| `/models` | List available local Ollama models |
 | `/session` | Display current session info |
 | `/resume <id>` | Load a previous session |
 | `/context` | Show what the context engine has assembled |
+| `/index` | Rebuild the current project index |
+| `/syscheck` | Run hardware and dependency checks |
+| `/tasks` | List user tasks in the current session |
 | `/mode <mode>` | Switch hardware mode for the current session |
 | `/diff` | Show the diff of the last file edit |
 | `/clear` | Clear the terminal |
@@ -203,7 +194,7 @@ local-llm-assistant/
 ├── models/          Ollama client, embedding client, model registry
 ├── system/          Hardware detector, dependency installer, Ollama manager
 ├── tasks/           Task planner, classifier, schema definitions
-├── tools/           10 built-in tools: read/write, git, shell, search, web, …
+├── tools/           12 built-in tools: read/write, search, shell, git, web, …
 ├── tests/           Test suite skeleton
 ├── main.py          Entry point & runtime orchestrator
 ├── sentinel.bat     Windows launcher
