@@ -186,8 +186,13 @@ class RAGEngine:
     # Search
     # ------------------------------------------------------------------
 
-    def search(self, query: str, top_k: int = 5) -> List[SearchResult]:
+    def search(self, query: str, top_k: int = 5) -> List["SearchResult"]:
         """Find the most relevant chunks for a query string.
+
+        Results are cached in ``~/.sentinel/cache/rag/`` keyed on
+        SHA-256(query + index_hash + top_k).  The index_hash is derived from
+        the SHA-256 of the persisted vectors file so the cache is
+        automatically invalidated when the project is re-indexed.
 
         Args:
             query: Natural-language or code query string.
@@ -199,6 +204,28 @@ class RAGEngine:
         if not self._chunks or self._vectors is None or len(self._vectors) == 0:
             return []
 
+        # ── RAG cache read ────────────────────────────────────────────
+        index_hash = self._index_hash()
+        try:
+            from context.context_cache import cache as _ctx_cache
+            cached_hits = _ctx_cache.get_rag(query, index_hash, top_k)
+            if cached_hits is not None:
+                # Reconstruct SearchResult objects from cached dicts
+                results: List[SearchResult] = []
+                for hit in cached_hits:
+                    chunk_data = hit.get("chunk", {})
+                    if chunk_data:
+                        results.append(SearchResult(
+                            chunk=Chunk(**chunk_data),
+                            score=float(hit.get("score", 0.0)),
+                            rank=int(hit.get("rank", 0)),
+                        ))
+                if results:
+                    return results
+        except Exception:
+            _ctx_cache = None
+
+        # ── Cosine search ─────────────────────────────────────────────
         query_vec = self._embed_text(query)
         if query_vec is None:
             return []
@@ -206,7 +233,7 @@ class RAGEngine:
         scores = self._cosine_similarity(query_vec, self._vectors)
         top_indices = np.argsort(scores)[::-1][:top_k]
 
-        results: List[SearchResult] = []
+        results = []
         for rank, idx in enumerate(top_indices, start=1):
             results.append(
                 SearchResult(
@@ -215,7 +242,42 @@ class RAGEngine:
                     rank=rank,
                 )
             )
+
+        # ── RAG cache write ───────────────────────────────────────────
+        try:
+            from context.context_cache import cache as _ctx_cache2
+            serialised = [
+                {
+                    "chunk": {
+                        "chunk_id":   r.chunk.chunk_id,
+                        "file_path":  r.chunk.file_path,
+                        "start_line": r.chunk.start_line,
+                        "end_line":   r.chunk.end_line,
+                        "content":    r.chunk.content,
+                        "language":   r.chunk.language,
+                    },
+                    "score": r.score,
+                    "rank":  r.rank,
+                }
+                for r in results
+            ]
+            _ctx_cache2.set_rag(query, index_hash, top_k, serialised)
+        except Exception:
+            pass
+
         return results
+
+    def _index_hash(self) -> str:
+        """Return a short hash of the current vectors file for cache keying."""
+        import hashlib as _hashlib
+        try:
+            vf = self._vectors_file()
+            if vf.exists():
+                data = vf.read_bytes()[:4096]  # first 4 KB is enough for a hash
+                return _hashlib.sha256(data).hexdigest()[:16]
+        except Exception:
+            pass
+        return "no-index"
 
     # ------------------------------------------------------------------
     # Index stats
@@ -444,15 +506,32 @@ class RAGEngine:
     def _embed_text(self, text: str) -> Optional[np.ndarray]:
         """Call the Ollama embeddings API for a single text string.
 
+        Results are cached in ``~/.sentinel/cache/embeddings/`` keyed on
+        SHA-256(text) so that unchanged chunks are never re-embedded.
+
         Args:
             text: Text to embed (truncated to 2000 chars for safety).
 
         Returns:
             1D float32 numpy array, or None on failure.
         """
+        truncated = text[:2000]
+
+        # ── Cache read ────────────────────────────────────────────────
+        try:
+            from context.context_cache import cache as _ctx_cache
+            cached_vec = _ctx_cache.get_embedding(truncated)
+            if cached_vec is not None:
+                return cached_vec
+        except Exception:
+            _ctx_cache = None  # cache unavailable — proceed without it
+        else:
+            _ctx_cache = _ctx_cache  # keep reference for write below
+
+        # ── Embed via Ollama ──────────────────────────────────────────
         payload = {
             "model": self.embedding_model,
-            "prompt": text[:2000],
+            "prompt": truncated,
         }
         try:
             response = requests.post(
@@ -463,9 +542,17 @@ class RAGEngine:
             response.raise_for_status()
             data = response.json()
             vec = np.array(data["embedding"], dtype=np.float32)
-            return vec
         except (requests.RequestException, KeyError, ValueError):
             return None
+
+        # ── Cache write ───────────────────────────────────────────────
+        try:
+            from context.context_cache import cache as _ctx_cache2
+            _ctx_cache2.set_embedding(truncated, vec)
+        except Exception:
+            pass
+
+        return vec
 
     # ------------------------------------------------------------------
     # Helpers

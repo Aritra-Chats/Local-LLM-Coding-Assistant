@@ -892,36 +892,14 @@ class ExecutionPlanGenerator:
 # Helper functions (package-internal)
 # ---------------------------------------------------------------------------
 
-# Keyword → agent routing (mirrors concrete_planner routing table)
-_KEYWORD_AGENT_MAP: List[Tuple[frozenset, str]] = [
-    (frozenset({"write", "implement", "create", "code", "function", "class", "module", "refactor", "edit"}), "coding"),
-    (frozenset({"debug", "fix", "error", "traceback", "exception", "failing", "bug", "test"}), "debugging"),
-    (frozenset({"deploy", "docker", "ci", "cd", "pipeline", "shell", "install", "dependency", "git", "commit", "diff"}), "devops"),
-    (frozenset({"search", "research", "find", "look up", "web", "documentation", "docs"}), "research"),
-    (frozenset({"reason", "explain", "analyse", "analyze", "summarise", "summarize", "decide", "compare", "evaluate"}), "reasoning"),
-    (frozenset({"open", "launch", "start", "system", "process", "os", "platform"}), "system"),
-]
-
-_AGENT_DEFAULT_TOOLS: Dict[str, List[str]] = {
-    "coding": ["read_file", "write_file", "search_code"],
-    "debugging": ["run_tests", "run_shell", "read_file", "search_code"],
-    "devops": ["run_shell", "git_diff", "git_commit", "install_dependency"],
-    "research": ["web_search", "read_file"],
-    "reasoning": [],
-    "system": ["open_application", "run_shell", "install_dependency"],
-}
-
-
-def _route_by_keywords(description: str) -> str:
-    lower = description.lower()
-    for keywords, agent in _KEYWORD_AGENT_MAP:
-        if any(kw in lower for kw in keywords):
-            return agent
-    return "coding"
-
-
-def _default_tools_for_agent(agent: str) -> List[str]:
-    return list(_AGENT_DEFAULT_TOOLS.get(agent, []))
+# Routing and alias data now live in core.categories — single source of truth.
+# These thin wrappers preserve the existing internal call sites.
+from core.categories import (  # noqa: E402
+    KEYWORD_AGENT_MAP   as _KEYWORD_AGENT_MAP,
+    AGENT_DEFAULT_TOOLS as _AGENT_DEFAULT_TOOLS,
+    route_by_keywords        as _route_by_keywords,
+    default_tools_for_agent  as _default_tools_for_agent,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -165,6 +165,26 @@ class RunShellTool(Tool):
         if env_extra:
             env.update({str(k): str(v) for k, v in env_extra.items()})
 
+        # --- Windows .cmd/.bat resolution ---
+        # On Windows, tools like `npm`, `npx`, `node` are .cmd batch scripts.
+        # subprocess with shell=False cannot find them; resolve via shutil.which
+        # which respects PATHEXT, or fall back to shell=True.
+        import shutil
+        import sys as _sys
+        if not shell and _sys.platform == "win32":
+            resolved_exe = shutil.which(first_token)
+            if resolved_exe is None:
+                # Try appending common Windows script extensions
+                for ext in (".cmd", ".bat", ".ps1"):
+                    resolved_exe = shutil.which(first_token + ext)
+                    if resolved_exe:
+                        break
+            if resolved_exe:
+                args[0] = resolved_exe  # type: ignore[possibly-undefined]
+            else:
+                # Fall back to shell=True so cmd.exe can resolve the command
+                shell = True
+
         # --- execution ---
         cmd_arg = command if shell else args  # type: ignore[possibly-undefined]
         try:

@@ -89,7 +89,7 @@ pip install -r requirements.txt
 # Launch
 python main.py
 # or use the launcher:
-run_sentinel.bat
+sentinel.bat
 ```
 
 ---

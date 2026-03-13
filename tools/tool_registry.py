@@ -154,6 +154,9 @@ class Tool:
     description: str = ""
     parameters_schema: Dict[str, Any] = {}
 
+    # Params silently injected by the execution engine — never treat as unknown.
+    _INTERNAL_PARAMS: frozenset = frozenset({"project_root"})
+
     def run(self, **kwargs: Any) -> ToolResult:
         """Execute the tool.  Subclasses must override."""
         raise NotImplementedError(f"{self.__class__.__name__} must implement run()")
@@ -168,7 +171,7 @@ class Tool:
         for pname, pdef in schema.items():
             if pdef.get("required") and pname not in params:
                 return False, f"Missing required parameter '{pname}' for tool '{self.name}'"
-        unknown = set(params) - set(schema)
+        unknown = set(params) - set(schema) - self._INTERNAL_PARAMS
         if unknown:
             return False, f"Unknown parameters for tool '{self.name}': {sorted(unknown)}"
         return True, None

@@ -158,8 +158,8 @@ python main.py --mode minimal
 python main.py --no-bootstrap
 
 # Windows launcher
-run_sentinel.bat
-run_sentinel.bat --resume ses_20260312_143201
+sentinel.bat
+sentinel.bat --resume ses_20260312_143201
 ```
 
 ### Slash commands inside the REPL
@@ -205,12 +205,10 @@ local-llm-assistant/
 ├── tasks/           Task planner, classifier, schema definitions
 ├── tools/           10 built-in tools: read/write, git, shell, search, web, …
 ├── tests/           Test suite skeleton
-├── docs/            Extended documentation
 ├── main.py          Entry point & runtime orchestrator
-├── run_sentinel.bat Windows launcher
+├── sentinel.bat     Windows launcher
 ├── pyproject.toml
-├── requirements.txt
-└── .env.example
+└── requirements.txt
 ```
 
 ---

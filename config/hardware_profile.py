@@ -204,7 +204,7 @@ class HardwareProfiler:
                 context_limit=8192,
                 max_pipeline_concurrency=2,
                 embedding_model="nomic-embed-text",
-                reasoning_model="mixtral:8x7b",
+                reasoning_model="mistral-nemo:12b",
                 notes=notes,
             )
 
@@ -215,7 +215,7 @@ class HardwareProfiler:
             context_limit=16384,
             max_pipeline_concurrency=4,
             embedding_model="nomic-embed-text",
-            reasoning_model="mixtral:8x7b",
+            reasoning_model="mistral-nemo:12b",
             notes=notes,
         )
 

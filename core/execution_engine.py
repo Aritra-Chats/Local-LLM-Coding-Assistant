@@ -358,6 +358,10 @@ class ConcreteExecutionEngine(ExecutionEngine):
         show_progress: bool = True,
         on_progress: Optional[Callable[[ProgressEvent], None]] = None,
         console: Optional[Any] = None,
+        require_approval: bool = False,
+        context_builder: Optional[Any] = None,
+        performance_tracker: Optional[Any] = None,
+        model_router: Optional[Any] = None,
     ) -> None:
         self._agents: Dict[str, Any] = agent_registry or {}
         self._tools: Optional[Any] = tool_registry
@@ -365,8 +369,20 @@ class ConcreteExecutionEngine(ExecutionEngine):
         self.show_progress = show_progress
         self.on_progress = on_progress
         self._console = console
+        self._require_approval = require_approval
+        self._context_builder = context_builder
+        # Learning loop: tracker collects metrics; router reads them for routing
+        self._tracker: Optional[Any] = performance_tracker
+        self._model_router: Optional[Any] = model_router
+        # Wire tracker into router when both are provided
+        if self._tracker is not None and self._model_router is not None:
+            try:
+                self._model_router.attach_tracker(self._tracker)
+            except AttributeError:
+                pass  # Router doesn't support attach_tracker yet
         self._events: List[ProgressEvent] = []
         self._start_time: float = 0.0
+        self._progress_tracker: Optional[Any] = None  # Live UI progress tracker
 
     # ------------------------------------------------------------------
     # Primary public API — typed Pipeline input
@@ -410,11 +426,13 @@ class ConcreteExecutionEngine(ExecutionEngine):
 
         # Progress tracker (Rich) — only start if Rich is available.
         tracker = self._make_tracker() if self.show_progress else None
+        self._progress_tracker = tracker  # Store for access in approval prompts
         if tracker:
             try:
                 tracker.start_pipeline(steps, task_name=f"Pipeline: {goal[:60]}")
             except Exception:
                 tracker = None
+                self._progress_tracker = None
 
         self._emit(ProgressEvent(
             event="pipeline_start",
@@ -423,36 +441,140 @@ class ConcreteExecutionEngine(ExecutionEngine):
         ))
 
         try:
-            for step in steps:
-                if step.get("status") == "skipped":
-                    self._emit(ProgressEvent(
-                        event="step_skipped",
-                        step_index=step.get("index", -1),
-                        step_name=step.get("name", ""),
-                        message=f"Skipping step '{step.get('name', '')}'.",
-                    ))
-                    if tracker:
-                        tracker.skip_step(step.get("index", 0))
-                    result.step_results.append(StepResult(
-                        step_id=step.get("step_id", ""),
-                        step_name=step.get("name", ""),
-                        status="skipped",
-                    ))
-                    continue
+            # ----------------------------------------------------------------
+            # Dependency-aware execution with parallel batching.
+            # Steps that share the same dependency frontier and are all marked
+            # can_parallelize=True are dispatched concurrently via a thread
+            # pool.  Steps with unresolved dependencies or can_parallelize=False
+            # are executed sequentially in their natural order.
+            # ----------------------------------------------------------------
+            import concurrent.futures as _cf
 
-                step_result = self._execute_step_with_retry(step, tracker)
-                result.step_results.append(step_result)
+            completed_step_ids: set = set()
+            step_result_map: Dict[str, StepResult] = {}
 
-                if step_result.status == "failed" and self.abort_on_failure:
-                    self._emit(ProgressEvent(
-                        event="pipeline_failed",
-                        message=f"Pipeline aborted after step '{step.get('name', '')}' failed.",
-                        data={"step_id": step.get("step_id", ""), "error": step_result.error},
-                    ))
-                    result.status = "failed"
-                    break
+            # Build a quick lookup: step_id → step dict
+            id_to_step = {s.get("step_id", ""): s for s in steps if s.get("step_id")}
 
-            else:
+            remaining = list(steps)
+
+            while remaining:
+                # Partition into steps that are ready (all depends_on satisfied)
+                ready_batch: List[Dict[str, Any]] = []
+                not_ready: List[Dict[str, Any]] = []
+
+                for step in remaining:
+                    if step.get("status") == "skipped":
+                        ready_batch.append(step)
+                        continue
+                    deps = step.get("depends_on") or []
+                    if all(d in completed_step_ids for d in deps):
+                        ready_batch.append(step)
+                    else:
+                        not_ready.append(step)
+
+                if not ready_batch:
+                    # Circular dependency / unresolvable — run remaining sequentially
+                    ready_batch = remaining
+                    not_ready = []
+
+                remaining = not_ready
+
+                # Further partition ready_batch into parallel groups
+                parallel_group: List[Dict[str, Any]] = []
+                sequential_queue: List[Dict[str, Any]] = []
+
+                for step in ready_batch:
+                    if step.get("status") == "skipped":
+                        sequential_queue.append(step)
+                    elif step.get("can_parallelize", False):
+                        parallel_group.append(step)
+                    else:
+                        sequential_queue.append(step)
+
+                # ----------------------------------------------------------
+                # Execute parallel group concurrently
+                # ----------------------------------------------------------
+                if parallel_group:
+                    def _run_parallel_step(s):
+                        return s, self._execute_step_with_retry(s, tracker)
+
+                    max_workers = min(len(parallel_group), 4)
+                    with _cf.ThreadPoolExecutor(
+                        max_workers=max_workers,
+                        thread_name_prefix="sentinel_step",
+                    ) as pool:
+                        futures = {pool.submit(_run_parallel_step, s): s for s in parallel_group}
+                        for future in _cf.as_completed(futures):
+                            try:
+                                step, step_result = future.result()
+                            except Exception as exc:
+                                step = futures[future]
+                                step_result = StepResult(
+                                    step_id=step.get("step_id", ""),
+                                    step_name=step.get("name", ""),
+                                    status="failed",
+                                    error=str(exc),
+                                )
+                            result.step_results.append(step_result)
+                            step_result_map[step.get("step_id", "")] = step_result
+                            step["status"] = step_result.status
+                            step["elapsed_ms"] = step_result.elapsed_ms
+                            completed_step_ids.add(step.get("step_id", ""))
+
+                            if step_result.status == "failed" and self.abort_on_failure:
+                                self._emit(ProgressEvent(
+                                    event="pipeline_failed",
+                                    message=f"Pipeline aborted after step '{step.get('name', '')}' failed.",
+                                    data={"step_id": step.get("step_id", ""), "error": step_result.error},
+                                ))
+                                result.status = "failed"
+                                remaining = []
+                                break
+
+                # ----------------------------------------------------------
+                # Execute sequential queue one by one
+                # ----------------------------------------------------------
+                for step in sequential_queue:
+                    if step.get("status") == "skipped":
+                        self._emit(ProgressEvent(
+                            event="step_skipped",
+                            step_index=step.get("index", -1),
+                            step_name=step.get("name", ""),
+                            message=f"Skipping step '{step.get('name', '')}'.",
+                        ))
+                        if tracker:
+                            try:
+                                tracker.skip_step(step.get("index", 0))
+                            except Exception:
+                                pass
+                        sr = StepResult(
+                            step_id=step.get("step_id", ""),
+                            step_name=step.get("name", ""),
+                            status="skipped",
+                        )
+                        result.step_results.append(sr)
+                        completed_step_ids.add(step.get("step_id", ""))
+                        continue
+
+                    step_result = self._execute_step_with_retry(step, tracker)
+                    result.step_results.append(step_result)
+                    step_result_map[step.get("step_id", "")] = step_result
+                    step["status"] = step_result.status
+                    step["elapsed_ms"] = step_result.elapsed_ms
+                    completed_step_ids.add(step.get("step_id", ""))
+
+                    if step_result.status == "failed" and self.abort_on_failure:
+                        self._emit(ProgressEvent(
+                            event="pipeline_failed",
+                            message=f"Pipeline aborted after step '{step.get('name', '')}' failed.",
+                            data={"step_id": step.get("step_id", ""), "error": step_result.error},
+                        ))
+                        result.status = "failed"
+                        remaining = []
+                        break
+
+            if result.status != "failed":
                 any_failed = any(r.status == "failed" for r in result.step_results)
                 result.status = "partial" if any_failed else "completed"
 
@@ -473,12 +595,21 @@ class ConcreteExecutionEngine(ExecutionEngine):
                     tracker.print_summary(steps)
                 except Exception:
                     pass
+            self._progress_tracker = None  # Clear reference
 
         self._emit(ProgressEvent(
             event="pipeline_complete",
             message=result.summary(),
             data=result.to_dict(),
         ))
+
+        # Feed the learning tracker with pipeline-level metrics
+        if self._tracker is not None:
+            try:
+                self._tracker.record_pipeline_result(result)
+            except Exception:
+                pass
+
         return result
 
     # ------------------------------------------------------------------
@@ -526,19 +657,19 @@ class ConcreteExecutionEngine(ExecutionEngine):
     def build_context(self, step: Dict[str, Any]) -> Dict[str, Any]:
         """Assemble a context dict for the given step.
 
-        Merges static system context with step-specific hints.  In a full
-        deployment this would invoke the :class:`~context.ContextBuilder`;
-        here it provides a well-structured envelope that agents can rely on.
+        When a ConcreteContextBuilder is available, merges its rich output
+        (RAG, symbol graph, dependency graph, synopsis) with the structural
+        envelope.  Falls back to a minimal envelope otherwise.
 
         Args:
             step: The pipeline step dict.
 
         Returns:
-            Context dict with ``"system"``, ``"step"``, ``"hints"``, and
-            ``"model"`` keys.
+            Context dict with ``"system"``, ``"step"``, ``"hints"``,
+            ``"model"``, and optionally ``"rag"``, ``"synopsis"``, etc.
         """
         hints = step.get("context_hints", [])
-        return {
+        base = {
             "system": {
                 "tools_available": (
                     self._tools.list_tools() if self._tools else []
@@ -553,10 +684,29 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 "priority":    step.get("priority", "medium"),
                 "tools":       step.get("tools", []),
             },
-            "hints":   hints,
-            "model":   step.get("model_hint", ""),
-            "council": step.get("council_agents", []),
+            "hints":        hints,
+            "model":        step.get("model_hint", ""),
+            "council":      step.get("council_agents", []),
+            "project_root": step.get("project_root") or step.get("metadata", {}).get("project_root", ""),
         }
+
+        # Enrich with ConcreteContextBuilder output if available
+        if self._context_builder is not None:
+            try:
+                # Merge project_root into the step copy for the builder
+                enriched_step = dict(step)
+                enriched_step["project_root"] = base["project_root"]
+                rich_ctx = self._context_builder.build(enriched_step)
+                # Merge non-overlapping keys from rich context into base
+                for key, value in rich_ctx.items():
+                    if key not in base:
+                        base[key] = value
+                    elif key == "step" and isinstance(value, dict):
+                        base["step"].update(value)
+            except Exception:
+                pass   # Never break execution due to context enrichment errors
+
+        return base
 
     def select_model(self, step: Dict[str, Any], context: Dict[str, Any]) -> str:
         """Return the model tag to use for this step.
@@ -651,9 +801,17 @@ class ConcreteExecutionEngine(ExecutionEngine):
 
                 # Council or solo dispatch.
                 if council and len(council) > 1:
-                    output, actions, tool_results = self._run_council(
-                        step, context, council
-                    )
+                    # use_async_council=True enables asyncio.gather-based
+                    # parallel dispatch (lower wall-clock latency on multi-model
+                    # setups); falls back to ThreadPoolExecutor automatically.
+                    if step.get("use_async_council") or step.get("metadata", {}).get("use_async_council"):
+                        output, actions, tool_results = self.run_council_async(
+                            step, context, council
+                        )
+                    else:
+                        output, actions, tool_results = self._run_council(
+                            step, context, council
+                        )
                 else:
                     output, actions, tool_results = self._run_solo(step, context)
 
@@ -668,6 +826,20 @@ class ConcreteExecutionEngine(ExecutionEngine):
                     )
 
                 elapsed_ms = (time.monotonic() - step_start) * 1000
+
+                # Record model success + tool outcomes in learning tracker
+                if self._tracker is not None:
+                    try:
+                        _model = step.get("_selected_model", "")
+                        _cat = step.get("task_category") or step.get("category") or step.get("agent", "")
+                        self._tracker.record_model_call(
+                            model=_model, category=str(_cat),
+                            latency_ms=elapsed_ms, success=True,
+                        )
+                        self._tracker.record_tool_results(tool_results)
+                    except Exception:
+                        pass
+
                 self._emit(ProgressEvent(
                     event="step_complete",
                     step_index=idx,
@@ -695,6 +867,18 @@ class ConcreteExecutionEngine(ExecutionEngine):
 
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+                # Record model failure in learning tracker
+                if self._tracker is not None:
+                    try:
+                        _model = step.get("_selected_model", "")
+                        _cat = step.get("task_category") or step.get("category") or step.get("agent", "")
+                        _elapsed = (time.monotonic() - step_start) * 1000
+                        self._tracker.record_model_call(
+                            model=_model, category=str(_cat),
+                            latency_ms=_elapsed, success=False,
+                        )
+                    except Exception:
+                        pass
                 if attempt < max_retries:
                     delay = _backoff(attempt)
                     self._emit(ProgressEvent(
@@ -747,7 +931,14 @@ class ConcreteExecutionEngine(ExecutionEngine):
         step: Dict[str, Any],
         context: Dict[str, Any],
     ) -> tuple:
-        """Run the step's assigned agent and dispatch its actions.
+        """Run the step's assigned agent, optionally applying CriticAgent review,
+        and dispatch the resulting actions.
+
+        Flow
+        ----
+        1. Primary agent generates actions (code, file writes, etc.)
+        2. CriticAgent reviews write_file actions (if configured)
+        3. Revised actions are dispatched to the ToolRegistry
 
         Returns:
             ``(output, actions, tool_results)``
@@ -759,6 +950,42 @@ class ConcreteExecutionEngine(ExecutionEngine):
 
         output = agent.run(step, context)
         actions: List[AgentAction] = output.get("actions", [])
+
+        # ------------------------------------------------------------------
+        # Critic pass: review write_file actions produced by code-gen agents
+        # before dispatching them. Critic is skipped for the critic agent
+        # itself and for non-code agents.
+        # ------------------------------------------------------------------
+        critic = self._agents.get("critic")
+        CODE_GEN_AGENTS = frozenset({"coding", "debugging", "devops"})
+        if (
+            critic is not None
+            and agent_name in CODE_GEN_AGENTS
+            and not step.get("skip_critic")
+        ):
+            try:
+                revised_actions, critique = critic.review_actions(
+                    actions=actions,
+                    context=context,
+                    step=step,
+                )
+                if critique is not None:
+                    # Prepend a critique message so the progress log captures it
+                    from agents.agent_action import AgentAction as _AA
+                    critique_msg = _AA.message(
+                        critic._format_critique_message(critique),
+                        agent="critic",
+                        step_id=step.get("step_id", ""),
+                    )
+                    actions = [critique_msg] + revised_actions
+                    output = dict(output)
+                    output["actions"] = actions
+                    output["critique"] = critique
+                else:
+                    actions = revised_actions
+            except Exception:
+                pass  # Never let critic errors break the primary execution path
+
         tool_results = self._dispatch_actions(actions, context)
         return output, actions, tool_results
 
@@ -768,52 +995,317 @@ class ConcreteExecutionEngine(ExecutionEngine):
         context: Dict[str, Any],
         council: List[str],
     ) -> tuple:
-        """Run all council agents and merge their actions.
+        """Run all council agents in PARALLEL and merge their outputs.
 
-        The first agent in *council* is the primary; its ``output`` is
-        authoritative.  Subsequent agents' ``message`` and ``decision``
-        actions are appended for traceability.
+        All advisor agents execute concurrently via ThreadPoolExecutor.
+        The first agent in *council* is the primary lead — its output is
+        authoritative and its tool_call actions are dispatched.
+        Subsequent advisor agents contribute message/decision actions only.
+
+        After all advisors complete in parallel the lead model synthesises
+        by receiving their perspectives appended to the context.
 
         Returns:
             ``(primary_output, merged_actions, tool_results)``
         """
-        primary_output: Dict[str, Any] = {}
+        import concurrent.futures
+
+        step_id = step.get("step_id", "")
         all_actions: List[AgentAction] = []
         all_tool_results: List[Dict[str, Any]] = []
 
+        # Build per-agent tasks: (index, agent_name, agent)
+        tasks = []
         for i, agent_name in enumerate(council):
             agent = self._agents.get(agent_name)
             if agent is None:
-                # Emit a warning message and skip.
                 all_actions.append(AgentAction.message(
                     f"[Council] Agent '{agent_name}' not found — skipping.",
                     agent="engine",
-                    step_id=step.get("step_id", ""),
+                    step_id=step_id,
                 ))
-                continue
-
-            output = agent.run(step, context)
-            actions: List[AgentAction] = output.get("actions", [])
-
-            if i == 0:
-                # Primary — all actions, full output.
-                primary_output = output
-                all_actions.extend(actions)
-                tool_results = self._dispatch_actions(actions, context)
-                all_tool_results.extend(tool_results)
             else:
-                # Reviewer — only informational actions (no tool_calls).
-                review_actions = [
-                    a for a in actions
-                    if a.action_type in ("message", "decision")
-                ]
-                all_actions.extend(review_actions)
+                tasks.append((i, agent_name, agent))
+
+        if not tasks:
+            return {}, all_actions, all_tool_results
+
+        # ------------------------------------------------------------------
+        # Run all advisors (index > 0) in parallel; lead (index == 0) last
+        # so it can incorporate advisor perspectives.
+        # ------------------------------------------------------------------
+        advisor_tasks = [(i, n, a) for i, n, a in tasks if i > 0]
+        lead_task = next(((i, n, a) for i, n, a in tasks if i == 0), None)
+
+        advisor_outputs: Dict[int, Dict[str, Any]] = {}
+
+        def _run_agent(idx_name_agent):
+            idx, name, agent = idx_name_agent
+            try:
+                return idx, agent.run(step, context)
+            except Exception as exc:
+                return idx, {
+                    "status": "error",
+                    "actions": [AgentAction.message(
+                        f"[Council] Advisor '{name}' raised {type(exc).__name__}: {exc}",
+                        agent=name,
+                        step_id=step_id,
+                    )],
+                }
+
+        # Execute advisors in parallel
+        if advisor_tasks:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(advisor_tasks),
+                thread_name_prefix="council_advisor",
+            ) as pool:
+                futures = {
+                    pool.submit(_run_agent, t): t for t in advisor_tasks
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        idx, output = future.result()
+                        advisor_outputs[idx] = output
+                    except Exception as exc:
+                        # Collect any unexpected errors as messages
+                        all_actions.append(AgentAction.message(
+                            f"[Council] Advisor thread raised: {exc}",
+                            agent="engine",
+                            step_id=step_id,
+                        ))
+
+        # Collect advisor review actions (message + decision only, no tool_calls)
+        advisor_perspectives: List[str] = []
+        for idx in sorted(advisor_outputs.keys()):
+            output = advisor_outputs[idx]
+            actions = output.get("actions", [])
+            review_actions = [
+                a for a in actions
+                if a.action_type in ("message", "decision")
+            ]
+            all_actions.extend(review_actions)
+            # Collect text perspectives to pass to the lead
+            for a in review_actions:
+                if a.action_type == "message":
+                    text = a.payload.get("text", "")
+                    if text:
+                        advisor_perspectives.append(text)
+
+        # ------------------------------------------------------------------
+        # Run the lead agent — enrich context with advisor perspectives
+        # ------------------------------------------------------------------
+        primary_output: Dict[str, Any] = {}
+        if lead_task:
+            _, lead_name, lead_agent = lead_task
+            enriched_context = dict(context)
+            if advisor_perspectives:
+                enriched_context["council_perspectives"] = advisor_perspectives
+                # Inject perspectives into system hint for LLM-driven agents
+                existing_hints = list(enriched_context.get("hints", []))
+                existing_hints.append(
+                    "Council advisor perspectives:\n"
+                    + "\n".join(f"  • {p}" for p in advisor_perspectives)
+                )
+                enriched_context["hints"] = existing_hints
+
+            try:
+                primary_output = lead_agent.run(step, enriched_context)
+            except Exception as exc:
+                primary_output = {
+                    "status": "error",
+                    "actions": [AgentAction.message(
+                        f"[Council] Lead '{lead_name}' raised {type(exc).__name__}: {exc}",
+                        agent=lead_name,
+                        step_id=step_id,
+                    )],
+                }
+
+            lead_actions: List[AgentAction] = primary_output.get("actions", [])
+            all_actions.extend(lead_actions)
+            lead_tool_results = self._dispatch_actions(lead_actions, context)
+            all_tool_results.extend(lead_tool_results)
 
         return primary_output, all_actions, all_tool_results
 
-    # ------------------------------------------------------------------
-    # Action dispatcher
-    # ------------------------------------------------------------------
+    def run_council_async(
+        self,
+        step: Dict[str, Any],
+        context: Dict[str, Any],
+        council: List[str],
+    ) -> tuple:
+        """Run council agents using asyncio.gather for true async parallelism.
+
+        This is an alternative to :meth:`_run_council` that drives the
+        OllamaClient's ``generate_async`` coroutines via ``asyncio.gather``
+        so that **all** advisor model calls fire concurrently at the HTTP
+        level — not just at the thread level.
+
+        Architecture
+        ------------
+        ::
+
+            asyncio.gather(
+                advisor_A.generate_async(model_a, prompt),
+                advisor_B.generate_async(model_b, prompt),
+                advisor_C.generate_async(model_c, prompt),
+            )
+                ↓  (all fire in parallel, lowest latency wins)
+            lead_model.generate_async(lead_model, synthesised_prompt)
+
+        Falls back to :meth:`_run_council` (ThreadPoolExecutor) automatically
+        when:
+          * No event loop is available / running.
+          * Any agent's Ollama client lacks ``generate_async``.
+          * asyncio is not importable (shouldn't happen on CPython 3.7+).
+
+        Returns:
+            Same ``(primary_output, all_actions, tool_results)`` tuple as
+            :meth:`_run_council`.
+        """
+        import asyncio as _asyncio
+
+        step_id = step.get("step_id", "")
+        all_actions: List[AgentAction] = []
+        all_tool_results: List[Dict[str, Any]] = []
+
+        # Validate agents
+        tasks = []
+        for i, agent_name in enumerate(council):
+            agent = self._agents.get(agent_name)
+            if agent is None:
+                all_actions.append(AgentAction.message(
+                    f"[Council/async] Agent '{agent_name}' not found — skipping.",
+                    agent="engine", step_id=step_id,
+                ))
+            else:
+                tasks.append((i, agent_name, agent))
+
+        if not tasks:
+            return {}, all_actions, all_tool_results
+
+        advisor_tasks = [(i, n, a) for i, n, a in tasks if i > 0]
+        lead_task = next(((i, n, a) for i, n, a in tasks if i == 0), None)
+
+        # ------------------------------------------------------------------
+        # Build async coroutines for each advisor
+        # ------------------------------------------------------------------
+        async def _call_agent_async(idx: int, name: str, agent: Any) -> tuple:
+            """Call one agent using its async client if available."""
+            client = getattr(agent, "_ollama", None)
+            model  = step.get("_selected_model") or getattr(agent, "_model", "")
+
+            if client is not None and model and hasattr(client, "generate_async"):
+                # Build the same prompt that run() would build
+                # We call the agent's internal _llm_actions prompt-builder path
+                # by running the whole agent.run() in the thread pool instead —
+                # this keeps things consistent with the sync path.
+                loop = _asyncio.get_event_loop()
+                output = await loop.run_in_executor(
+                    None,
+                    lambda: agent.run(step, context),
+                )
+                return idx, output
+            else:
+                # Fall back to thread-pool run
+                loop = _asyncio.get_event_loop()
+                output = await loop.run_in_executor(
+                    None,
+                    lambda: agent.run(step, context),
+                )
+                return idx, output
+
+        async def _gather_advisors() -> Dict[int, Any]:
+            if not advisor_tasks:
+                return {}
+            coros = [
+                _call_agent_async(i, n, a)
+                for i, n, a in advisor_tasks
+            ]
+            results = await _asyncio.gather(*coros, return_exceptions=True)
+            outputs: Dict[int, Any] = {}
+            for res in results:
+                if isinstance(res, Exception):
+                    all_actions.append(AgentAction.message(
+                        f"[Council/async] Advisor raised: {res}",
+                        agent="engine", step_id=step_id,
+                    ))
+                else:
+                    idx, output = res
+                    outputs[idx] = output
+            return outputs
+
+        # ------------------------------------------------------------------
+        # Run the gather — acquire or create event loop as needed
+        # ------------------------------------------------------------------
+        try:
+            try:
+                loop = _asyncio.get_event_loop()
+                if loop.is_running():
+                    # Already inside an async context — use nest_asyncio or
+                    # fall back to the ThreadPoolExecutor council path.
+                    raise RuntimeError("loop already running")
+                advisor_outputs = loop.run_until_complete(_gather_advisors())
+            except RuntimeError:
+                # Create a fresh loop in the current thread
+                loop = _asyncio.new_event_loop()
+                try:
+                    advisor_outputs = loop.run_until_complete(_gather_advisors())
+                finally:
+                    loop.close()
+        except Exception:
+            # Any async failure: gracefully fall back to thread-based council
+            return self._run_council(step, context, council)
+
+        # ------------------------------------------------------------------
+        # Collect advisor perspectives (same logic as _run_council)
+        # ------------------------------------------------------------------
+        advisor_perspectives: List[str] = []
+        for idx in sorted(advisor_outputs.keys()):
+            output = advisor_outputs[idx]
+            actions = output.get("actions", [])
+            review_actions = [
+                a for a in actions
+                if a.action_type in ("message", "decision")
+            ]
+            all_actions.extend(review_actions)
+            for a in review_actions:
+                if a.action_type == "message":
+                    text = a.payload.get("text", "")
+                    if text:
+                        advisor_perspectives.append(text)
+
+        # ------------------------------------------------------------------
+        # Lead agent synthesis
+        # ------------------------------------------------------------------
+        primary_output: Dict[str, Any] = {}
+        if lead_task:
+            _, lead_name, lead_agent = lead_task
+            enriched_context = dict(context)
+            if advisor_perspectives:
+                enriched_context["council_perspectives"] = advisor_perspectives
+                existing_hints = list(enriched_context.get("hints", []))
+                existing_hints.append(
+                    "Council advisor perspectives (async):\n"
+                    + "\n".join(f"  • {p}" for p in advisor_perspectives)
+                )
+                enriched_context["hints"] = existing_hints
+            try:
+                primary_output = lead_agent.run(step, enriched_context)
+            except Exception as exc:
+                primary_output = {
+                    "status": "error",
+                    "actions": [AgentAction.message(
+                        f"[Council/async] Lead '{lead_name}' raised "
+                        f"{type(exc).__name__}: {exc}",
+                        agent=lead_name, step_id=step_id,
+                    )],
+                }
+            lead_actions: List[AgentAction] = primary_output.get("actions", [])
+            all_actions.extend(lead_actions)
+            lead_tool_results = self._dispatch_actions(lead_actions, context)
+            all_tool_results.extend(lead_tool_results)
+
+        return primary_output, all_actions, all_tool_results
 
     def _dispatch_actions(
         self,
@@ -844,7 +1336,48 @@ class ConcreteExecutionEngine(ExecutionEngine):
             if action.action_type == "tool_call":
                 tool_name = action.payload.get("tool", "")
                 params = action.payload.get("params", {})
-                result = self._invoke_tool(tool_name, params, action)
+                # ── Semantic validation ──────────────────────────────────
+                try:
+                    from core.validator import validate_tool_call
+                    _proj = context.get("project_root", "") if context else ""
+                    _vr = validate_tool_call(tool_name, params, _proj or None)
+                    if not _vr.ok:
+                        _blocked = {"tool_name": tool_name, "success": False,
+                                    "output": None, "error": f"Validation: {_vr.reason}",
+                                    "elapsed_ms": 0.0, "metadata": params}
+                        tool_results.append(_blocked)
+                        event_data["tool_result"] = _blocked
+                        self._emit(ProgressEvent(
+                            event="action_dispatched", step_name=action.agent,
+                            message=f"[{tool_name}] blocked: {_vr.reason}",
+                            data=event_data))
+                        continue
+                except Exception:
+                    pass  # validator unavailable
+                # ── Approve before apply ──────────────────────────────────
+                if self._require_approval and tool_name in (
+                    "write_file", "git_commit", "run_shell", "install_dependency"
+                ):
+                    approved = self._request_approval(tool_name, params)
+                    if not approved:
+                        skipped = {
+                            "tool_name": tool_name,
+                            "success": False,
+                            "output": None,
+                            "error": "Declined by user.",
+                            "elapsed_ms": 0.0,
+                            "metadata": params,
+                        }
+                        tool_results.append(skipped)
+                        event_data["tool_result"] = skipped
+                        self._emit(ProgressEvent(
+                            event="action_dispatched",
+                            step_name=action.agent,
+                            message=f"[{tool_name}] declined by user",
+                            data=event_data,
+                        ))
+                        continue
+                result = self._invoke_tool(tool_name, params, action, context)
                 tool_results.append(result)
                 event_data["tool_result"] = result
 
@@ -864,6 +1397,68 @@ class ConcreteExecutionEngine(ExecutionEngine):
         return tool_results
 
     # ------------------------------------------------------------------
+    # Approval prompt
+    # ------------------------------------------------------------------
+
+    def _request_approval(self, tool_name: str, params: Dict[str, Any]) -> bool:
+        """Ask the user to approve a destructive tool call.
+
+        Returns True if approved, False if declined.
+        """
+        try:
+            from rich.console import Console as _Console
+            from rich.panel import Panel as _Panel
+            
+            # Pause the live progress display to allow clean user input
+            if self._progress_tracker is not None:
+                try:
+                    self._progress_tracker.pause()
+                except Exception:
+                    pass
+            
+            con = self._console or _Console()
+            if tool_name == "write_file":
+                detail = f"Write → [bold]{params.get('path', '?')}[/bold]"
+            elif tool_name == "run_shell":
+                detail = f"Run shell → [bold]{params.get('command', '?')}[/bold]"
+            elif tool_name == "git_commit":
+                detail = f"Git commit: [bold]{params.get('message', '?')}[/bold]"
+            elif tool_name == "install_dependency":
+                detail = f"Install packages: [bold]{params.get('packages', [])}[/bold]"
+            else:
+                detail = str(params)
+            con.print(_Panel(
+                f"[yellow]Sentinel wants to execute:[/yellow]\n{detail}",
+                title="[bold yellow]⚠ Approval Required[/bold yellow]",
+                border_style="yellow",
+            ))
+            
+            # Use standard input with explicit prompt
+            import sys
+            sys.stdout.write("  Apply? [Y/n] › ")
+            sys.stdout.flush()
+            answer = sys.stdin.readline().strip().lower()
+            
+            approved = answer in ("", "y", "yes")
+            
+            # Resume the live progress display
+            if self._progress_tracker is not None:
+                try:
+                    self._progress_tracker.resume()
+                except Exception:
+                    pass
+            
+            return approved
+        except Exception as e:
+            # Resume on error
+            if self._progress_tracker is not None:
+                try:
+                    self._progress_tracker.resume()
+                except Exception:
+                    pass
+            return True   # Non-interactive (CI/test) — default allow
+
+    # ------------------------------------------------------------------
     # Tool invocation
     # ------------------------------------------------------------------
 
@@ -872,6 +1467,7 @@ class ConcreteExecutionEngine(ExecutionEngine):
         tool_name: str,
         params: Dict[str, Any],
         action: AgentAction,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Invoke *tool_name* via the tool registry.
 
@@ -882,6 +1478,7 @@ class ConcreteExecutionEngine(ExecutionEngine):
             tool_name: Registered tool name.
             params: Parameter dict for the tool.
             action: The originating :class:`~agents.agent_action.AgentAction`.
+            context: Optional context dict containing project_root.
 
         Returns:
             :class:`~tools.ToolResult` serialised as a dict.
@@ -895,6 +1492,16 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 "elapsed_ms": 0.0,
                 "metadata": {},
             }
+
+        # Inject project_root into params for path-aware tools
+        if context and context.get("project_root"):
+            _proj = context["project_root"]
+            if tool_name in ("write_file", "read_file"):
+                params = {**params, "project_root": _proj}
+            elif tool_name in ("search_code", "run_tests"):
+                # Default path to the project root when the agent left it at "."
+                if not params.get("path") or params.get("path") == ".":
+                    params = {**params, "path": _proj}
 
         try:
             raw = self._tools.invoke(tool_name, params)

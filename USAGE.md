@@ -27,7 +27,7 @@ Complete reference for running Sentinel, using the interactive REPL, and integra
 python main.py
 
 # Windows launcher (handles venv activation automatically):
-run_sentinel.bat
+sentinel.bat
 ```
 
 On first launch, Sentinel runs its bootstrap sequence (hardware detection, model pulling, workspace setup). Subsequent launches skip this and start in a few seconds.

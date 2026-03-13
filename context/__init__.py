@@ -22,6 +22,9 @@ from context.project_synopsis import ProjectSynopsis
 from context.context_loader import ContextLoader, LoadResult, load_attachments
 from context.snippet_loader import SnippetLoader
 
+
+from context.context_cache import ContextCache, cache as context_cache
+from context.repo_explorer import RepoExplorer, ExplorationReport
 __all__ = [
     # Core context assembly
     "ContextBuilder",

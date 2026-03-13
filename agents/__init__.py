@@ -11,24 +11,48 @@ from agents.reasoning_agent import ReasoningAgent
 from agents.devops_agent import DevOpsAgent
 from agents.research_agent import ResearchAgent
 from agents.system_agent import SystemAgent
-from typing import Dict, Any
+from agents.critic_agent import CriticAgent
+from typing import Dict, Any, Optional
 
 
-def build_agent_registry() -> Dict[str, Any]:
+def build_agent_registry(model_router=None):
     """Instantiate and return the default agent registry."""
-    supervisor   = ConcreteSupervisorAgent()
-    planner      = ConcretePlannerAgent()
+    ollama_client = None
+    coding_model = ""
+    reasoning_model = ""
+    debugging_model = ""
+
+    if model_router is not None:
+        try:
+            from models.ollama_client import OllamaClient
+            client = OllamaClient()
+            if client.is_available():
+                ollama_client = client
+                coding_model    = model_router.select_coding_model()
+                reasoning_model = model_router.select_reasoning_model()
+                debugging_model = (
+                    model_router.select_debugging_model()
+                    if hasattr(model_router, "select_debugging_model")
+                    else coding_model
+                )
+        except Exception:
+            pass
+
+    supervisor   = ConcreteSupervisorAgent(ollama_client=ollama_client, model=reasoning_model)
+    planner      = ConcretePlannerAgent(ollama_client=ollama_client, model=reasoning_model)
     pipeline_gen = ConcretePipelineGeneratorAgent()
     return {
         "supervisor":         supervisor,
         "planner":            planner,
         "pipeline_generator": pipeline_gen,
-        "coding":             CodingAgent(),
-        "debugging":          DebuggingAgent(),
-        "reasoning":          ReasoningAgent(),
-        "devops":             DevOpsAgent(),
-        "research":           ResearchAgent(),
-        "system":             SystemAgent(),
+        "coding":    CodingAgent(ollama_client=ollama_client,   model=coding_model),
+        "debugging": DebuggingAgent(ollama_client=ollama_client, model=debugging_model),
+        "reasoning": ReasoningAgent(ollama_client=ollama_client, model=reasoning_model),
+        "devops":    DevOpsAgent(ollama_client=ollama_client,   model=reasoning_model),
+        "research":  ResearchAgent(ollama_client=ollama_client, model=reasoning_model),
+        "system":    SystemAgent(ollama_client=ollama_client,   model=reasoning_model),
+        # CriticAgent — reviews write_file actions before ToolRegistry dispatch
+        "critic":    CriticAgent(ollama_client=ollama_client,   model=reasoning_model),
     }
 
 
@@ -39,5 +63,6 @@ __all__ = [
     "PipelineGenerator", "ConcretePipelineGeneratorAgent",
     "CodingAgent", "DebuggingAgent", "ReasoningAgent",
     "DevOpsAgent", "ResearchAgent", "SystemAgent",
+    "CriticAgent",
     "build_agent_registry",
 ]

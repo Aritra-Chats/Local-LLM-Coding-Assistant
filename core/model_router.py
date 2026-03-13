@@ -92,12 +92,12 @@ Minimal   (≤12 GB RAM, CPU-only)
   coding  / debugging                     → codellama:7b
 
 Standard  (12–20 GB RAM)
-  reasoning / research                    → mistral:13b  (with mixtral:8x7b as upgrade)
+  reasoning / research                    → mistral-nemo:12b
   coding  / debugging / devops            → codellama:13b
   system                                  → mistral:7b
 
 Advanced  (≥20 GB RAM  OR  GPU ≥ 6 GB VRAM)
-  reasoning / research                    → mixtral:8x7b
+  reasoning / research                    → mistral-nemo:12b
   debugging                               → deepseek-coder:33b
   coding  / devops                        → codellama:34b
   system                                  → mistral:13b
@@ -142,15 +142,15 @@ _MODEL_CATALOGUE: Dict[Tuple[str, str], str] = {
     ("minimal", "coding"):     "codellama:7b",
     ("minimal", "debugging"):  "codellama:7b",
     # ── Standard ────────────────────────────────────────────────────────────
-    ("standard", "reasoning"): "mistral:13b",
-    ("standard", "research"):  "mistral:13b",
+    ("standard", "reasoning"): "mistral-nemo:12b",
+    ("standard", "research"):  "mistral-nemo:12b",
     ("standard", "coding"):    "codellama:13b",
     ("standard", "debugging"): "codellama:13b",
     ("standard", "devops"):    "codellama:13b",
     ("standard", "system"):    "mistral:7b",
     # ── Advanced ────────────────────────────────────────────────────────────
-    ("advanced", "reasoning"): "mixtral:8x7b",
-    ("advanced", "research"):  "mixtral:8x7b",
+    ("advanced", "reasoning"): "mistral-nemo:12b",
+    ("advanced", "research"):  "mistral-nemo:12b",
     ("advanced", "coding"):    "codellama:34b",
     ("advanced", "debugging"): "deepseek-coder:33b",
     ("advanced", "devops"):    "codellama:34b",
@@ -160,8 +160,8 @@ _MODEL_CATALOGUE: Dict[Tuple[str, str], str] = {
 # Default fallback when (mode, category) is not in catalogue
 _DEFAULT_MODEL: Dict[str, str] = {
     "minimal":  "mistral:7b",
-    "standard": "mistral:13b",
-    "advanced": "mixtral:8x7b",
+    "standard": "mistral-nemo:12b",
+    "advanced": "mistral-nemo:12b",
 }
 
 # ---------------------------------------------------------------------------
@@ -175,8 +175,8 @@ _FALLBACK_CHAINS: Dict[str, List[str]] = {
     "codellama:13b":      ["codellama:7b",    "mistral:7b"],
     "codellama:7b":       ["mistral:7b"],
     # General reasoning
-    "mixtral:8x7b":       ["mistral:13b",     "mistral:7b"],
-    "mistral:13b":        ["mistral:7b"],
+    "mixtral:8x7b":       ["mistral-nemo:12b", "mistral:7b"],
+    "mistral-nemo:12b":   ["mistral:7b"],
     "mistral:7b":         [],
 }
 
@@ -226,18 +226,18 @@ _MODEL_METADATA: List[Dict[str, Any]] = [
         "council_eligible": False,
     },
     {
-        "name":           "mistral:13b",
-        "size_gb":        7.8,
+        "name":           "mistral-nemo:12b",
+        "size_gb":        7.1,
         "capabilities":   ["reasoning", "research", "system"],
         "hardware_modes": ["standard", "advanced"],
-        "context_limit":  8192,
+        "context_limit":  128000,
         "council_eligible": False,
     },
     {
         "name":           "mixtral:8x7b",
         "size_gb":        26.0,
         "capabilities":   ["reasoning", "research", "devops", "system"],
-        "hardware_modes": ["advanced"],
+        "hardware_modes": ["standard", "advanced"],
         "context_limit":  32768,
         "council_eligible": True,
     },
@@ -351,23 +351,43 @@ class ModelPerformanceRecord:
 class ConcreteModelRouter(ModelRouter):
     """Hardware-aware, performance-tracking model router.
 
+    The router now integrates with :class:`~learning.metrics_tracker.PerformanceTracker`
+    so that observed model latency and success-rate data actively influences
+    routing decisions — not just logging.
+
     Args:
-        hardware_profile: Pre-built HardwareProfile.  When omitted the
-            router auto-detects the current machine on first call.
-        force_mode: Override the detected hardware mode
-            (``"minimal"`` | ``"standard"`` | ``"advanced"``).  Useful
-            for testing or locked deployments.
+        hardware_profile:   Pre-built HardwareProfile.  Auto-detected when omitted.
+        force_mode:         Override the detected hardware mode.
+        performance_tracker: Optional :class:`~learning.metrics_tracker.PerformanceTracker`
+            instance.  When supplied, the router reads rolling latency and
+            success-rate data from it to downgrade slow / failing models
+            before falling back to its own internal ``_perf`` records.
+        latency_threshold_ms: Rolling latency above which a model is considered
+            too slow and will be replaced by its fallback (default 8 000 ms).
     """
 
     def __init__(
         self,
         hardware_profile: Optional[HardwareProfile] = None,
         force_mode: Optional[str] = None,
+        performance_tracker: Optional[Any] = None,
+        latency_threshold_ms: float = 8_000.0,
     ) -> None:
         self._profile: Optional[HardwareProfile] = hardware_profile
         self._force_mode: Optional[str] = force_mode
-        # (model, category) → ModelPerformanceRecord
+        # (model, category) → ModelPerformanceRecord  (internal lightweight tracker)
         self._perf: Dict[Tuple[str, str], ModelPerformanceRecord] = {}
+        # External PerformanceTracker from the learning subsystem
+        self._ext_tracker: Optional[Any] = performance_tracker
+        self._latency_threshold_ms: float = latency_threshold_ms
+
+    def attach_tracker(self, tracker: Any) -> None:
+        """Attach (or replace) the external PerformanceTracker at runtime.
+
+        Args:
+            tracker: :class:`~learning.metrics_tracker.PerformanceTracker` instance.
+        """
+        self._ext_tracker = tracker
 
     # ------------------------------------------------------------------
     # ABC: select
@@ -379,15 +399,16 @@ class ConcreteModelRouter(ModelRouter):
         Selection logic (in priority order):
         1. Explicit ``model_hint`` on the step, if present and non-empty.
         2. Catalogue look-up by (hardware_mode, category).
-        3. Performance override — if the selected model is degraded, choose
-           its first non-degraded fallback.
-        4. Default model for the active hardware mode.
+        3. Learning override — if the external PerformanceTracker reports
+           high latency or low success rate for the selected model, replace
+           it with the first healthy fallback.
+        4. Internal performance degradation override (router's own EMA records).
+        5. Default model for the active hardware mode.
 
         Args:
             step:    Pipeline step dict; uses ``task_category``, ``category``,
                      ``agent``, and ``model_hint`` keys.
-            context: Assembled context payload; currently unused for routing
-                     but inspected for estimated token load in future work.
+            context: Assembled context payload.
 
         Returns:
             Ollama model identifier string.
@@ -404,13 +425,75 @@ class ConcreteModelRouter(ModelRouter):
         # 2. Catalogue look-up
         model = _MODEL_CATALOGUE.get((mode, category), _DEFAULT_MODEL.get(mode, "mistral:7b"))
 
-        # 3. Performance degradation override
+        # 3. Learning-system override — consult external PerformanceTracker
+        if self._ext_tracker is not None:
+            model = self._apply_learning_override(model, category) or model
+
+        # 4. Internal performance degradation override (router's own EMA)
         key = (model, category)
         rec = self._perf.get(key)
         if rec and rec.is_degraded:
             model = self._first_healthy_fallback(model, category) or model
 
+        # 5. Availability guard — ensure the chosen model is actually installed.
+        #    Walks the fallback chain to find the first installed alternative so
+        #    agents never receive a model tag that causes HTTP 404 from Ollama.
+        model = self.resolve_to_installed(model)
+
         return model
+
+    # ------------------------------------------------------------------
+    # Learning integration helpers
+    # ------------------------------------------------------------------
+
+    def _apply_learning_override(self, model: str, category: str) -> Optional[str]:
+        """Consult the external PerformanceTracker and return a better model.
+
+        Checks two conditions using the tracker's rolling metrics:
+        - Rolling success rate below PERFORMANCE_DEGRADED_THRESHOLD
+        - Rolling latency above self._latency_threshold_ms
+
+        If either condition is true the method walks the fallback chain and
+        returns the first model that passes both checks.
+
+        Args:
+            model:    The candidate model selected from the catalogue.
+            category: The task category.
+
+        Returns:
+            A replacement model string, or None if no change is needed.
+        """
+        try:
+            tracker_models = self._ext_tracker.get_model_metrics()
+        except Exception:
+            return None
+
+        # Build a quick lookup: (model_name, category) → metrics dict
+        metrics_map: Dict[Tuple[str, str], Dict] = {}
+        for m in tracker_models:
+            metrics_map[(m["model"], m["category"])] = m
+
+        def _is_healthy(m: str) -> bool:
+            met = metrics_map.get((m, category))
+            if met is None:
+                return True  # No data yet — assume healthy
+            if met["total_calls"] < 3:
+                return True  # Too few samples to judge
+            if met["rolling_success_rate"] < PERFORMANCE_DEGRADED_THRESHOLD:
+                return False
+            if met["rolling_latency_ms"] > self._latency_threshold_ms:
+                return False
+            return True
+
+        if _is_healthy(model):
+            return None  # Primary selection is fine
+
+        # Walk the fallback chain for a healthy alternative
+        for candidate in _FALLBACK_CHAINS.get(model, []):
+            if _is_healthy(candidate):
+                return candidate
+
+        return None  # All fallbacks degraded too — stick with primary
 
     # ------------------------------------------------------------------
     # ABC: get_available_models
@@ -531,38 +614,49 @@ class ConcreteModelRouter(ModelRouter):
     def select_reasoning_model(self, hardware_mode: Optional[str] = None) -> str:
         """Return the recommended reasoning model for the given hardware mode.
 
+        Resolves the catalogue tag against locally-installed Ollama models so
+        the returned tag is always pullable without a 404 error.
+
         Args:
             hardware_mode: Override mode; defaults to detected profile.
 
         Returns:
-            Ollama model identifier.
+            Ollama model identifier that is confirmed installed (or the
+            catalogue default when Ollama is unreachable).
         """
         mode = hardware_mode or self._active_mode(self._get_profile())
-        return _MODEL_CATALOGUE.get((mode, "reasoning"), _DEFAULT_MODEL.get(mode, "mistral:7b"))
+        preferred = _MODEL_CATALOGUE.get((mode, "reasoning"), _DEFAULT_MODEL.get(mode, "mistral:7b"))
+        return self.resolve_to_installed(preferred)
 
     def select_coding_model(self, hardware_mode: Optional[str] = None) -> str:
         """Return the recommended coding model for the given hardware mode.
 
+        Resolves the catalogue tag against locally-installed Ollama models.
+
         Args:
             hardware_mode: Override mode; defaults to detected profile.
 
         Returns:
-            Ollama model identifier.
+            Ollama model identifier that is confirmed installed.
         """
         mode = hardware_mode or self._active_mode(self._get_profile())
-        return _MODEL_CATALOGUE.get((mode, "coding"), _DEFAULT_MODEL.get(mode, "mistral:7b"))
+        preferred = _MODEL_CATALOGUE.get((mode, "coding"), _DEFAULT_MODEL.get(mode, "mistral:7b"))
+        return self.resolve_to_installed(preferred)
 
     def select_debugging_model(self, hardware_mode: Optional[str] = None) -> str:
         """Return the recommended debugging model for the given hardware mode.
 
+        Resolves the catalogue tag against locally-installed Ollama models.
+
         Args:
             hardware_mode: Override mode; defaults to detected profile.
 
         Returns:
-            Ollama model identifier.
+            Ollama model identifier that is confirmed installed.
         """
         mode = hardware_mode or self._active_mode(self._get_profile())
-        return _MODEL_CATALOGUE.get((mode, "debugging"), _DEFAULT_MODEL.get(mode, "mistral:7b"))
+        preferred = _MODEL_CATALOGUE.get((mode, "debugging"), _DEFAULT_MODEL.get(mode, "mistral:7b"))
+        return self.resolve_to_installed(preferred)
 
     # ------------------------------------------------------------------
     # Performance inspection
@@ -638,7 +732,7 @@ class ConcreteModelRouter(ModelRouter):
                     context_limit=8192,
                     max_pipeline_concurrency=2,
                     embedding_model="nomic-embed-text",
-                    reasoning_model="mistral:13b",
+                    reasoning_model="mistral-nemo:12b",
                     notes="Hardware detection failed; defaulting to Standard profile.",
                 )
         return self._profile
@@ -653,31 +747,22 @@ class ConcreteModelRouter(ModelRouter):
     def _step_category(step: Dict[str, Any]) -> str:
         """Extract the task category from a step dict.
 
-        Prefers the ``task_category`` key; falls back to ``category``,
-        then the first word of the assigned ``agent`` name.
+        Delegates to :func:`core.categories.normalise_category` so that
+        alias resolution is always consistent with the task manager.
 
         Args:
             step: Pipeline step dict.
 
         Returns:
-            Normalised lowercase category string.
+            Canonical lowercase category string.
         """
+        from core.categories import normalise_category
         raw = (
             step.get("task_category")
             or step.get("category")
             or step.get("agent", "")
         )
-        # agent names are like "coding_agent", "reasoning_agent" — strip suffix
-        cat = str(raw).lower().replace("_agent", "").replace("-", "_").strip()
-        # Map known aliases
-        _ALIAS = {
-            "code":   "coding",
-            "debug":  "debugging",
-            "plan":   "reasoning",
-            "search": "research",
-            "ops":    "devops",
-        }
-        return _ALIAS.get(cat, cat) if cat else "reasoning"
+        return normalise_category(str(raw)) if raw else "reasoning"
 
     def _first_healthy_fallback(self, model: str, category: str) -> Optional[str]:
         """Walk the fallback chain and return the first non-degraded model.
@@ -694,3 +779,75 @@ class ConcreteModelRouter(ModelRouter):
             if rec is None or not rec.is_degraded:
                 return candidate
         return None
+
+    # ------------------------------------------------------------------
+    # Installed-model resolution
+    # ------------------------------------------------------------------
+
+    # Simple in-process cache: set of model names confirmed available.
+    # Populated lazily on first call; invalidated by set_installed_models().
+    _installed_cache: Optional[frozenset] = None
+
+    def _get_installed_models(self) -> frozenset:
+        """Return the set of Ollama model tags currently installed locally.
+
+        Queries ``/api/tags`` once per process lifetime (cached on
+        ``_installed_cache``).  Returns an empty frozenset when Ollama is
+        unreachable — callers must handle that gracefully.
+        """
+        if ConcreteModelRouter._installed_cache is not None:
+            return ConcreteModelRouter._installed_cache
+        try:
+            from models.ollama_client import OllamaClient
+            tags = frozenset(OllamaClient().list_models())
+            ConcreteModelRouter._installed_cache = tags
+            return tags
+        except Exception:
+            return frozenset()
+
+    @classmethod
+    def invalidate_model_cache(cls) -> None:
+        """Clear the cached model list so the next call re-queries Ollama.
+
+        Call this after pulling a new model with ``ollama pull <tag>``.
+        """
+        cls._installed_cache = None
+
+    def resolve_to_installed(self, preferred: str) -> str:
+        """Return *preferred* if it is installed, otherwise the first installed
+        fallback from ``_FALLBACK_CHAINS``, or *preferred* itself as a last
+        resort (so the error comes from Ollama with a useful message).
+
+        This prevents HTTP 404 "model not found" errors when the catalogue
+        recommends a large model that the user hasn't pulled yet.
+
+        Args:
+            preferred: The model tag chosen by the catalogue / heuristic.
+
+        Returns:
+            An installed model tag, or *preferred* if nothing is available.
+        """
+        installed = self._get_installed_models()
+        if not installed:
+            # Ollama unreachable — can't determine what's installed;
+            # return preferred and let the caller surface the real error.
+            return preferred
+
+        if preferred in installed:
+            return preferred
+
+        # Walk the fallback chain for the first installed alternative
+        for candidate in _FALLBACK_CHAINS.get(preferred, []):
+            if candidate in installed:
+                return candidate
+
+        # No chain entry found — try any installed model that mentions a
+        # common base name (e.g. "mistral" matches "mistral:latest")
+        base = preferred.split(":")[0]
+        for tag in sorted(installed):
+            if tag.startswith(base):
+                return tag
+
+        # Absolute fallback: return the first installed model alphabetically,
+        # or the preferred tag so Ollama gives the user a clear error message.
+        return sorted(installed)[0] if installed else preferred

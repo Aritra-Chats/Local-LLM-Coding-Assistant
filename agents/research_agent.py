@@ -15,8 +15,18 @@ from typing import Any, Dict, List, Optional
 
 from agents.agent_action import AgentAction
 from agents.base_agent import BaseAgent
+from agents.coding_agent import _parse_llm_actions
 
 _ALLOWED_TOOLS = frozenset({"web_search", "read_file", "search_code"})
+
+_SYSTEM_PROMPT = """You are a research assistant. Given a task description, \
+decide which information-gathering operations are needed and respond with a JSON array of actions. \
+Each action must be one of:
+  {"tool": "web_search",  "params": {"query": "<search_query>", "max_results": 5}}
+  {"tool": "read_file",   "params": {"path": "<relative_path>"}}
+  {"tool": "search_code", "params": {"query": "<pattern>", "path": ".", "is_regex": false}}
+  {"tool": "message",     "params": {"text": "<explanation or findings>"}}
+Respond ONLY with a valid JSON array. No prose before or after it."""
 
 
 class ResearchAgent(BaseAgent):
@@ -37,6 +47,10 @@ class ResearchAgent(BaseAgent):
 
     name = "research"
 
+    def __init__(self, ollama_client: Optional[Any] = None, model: str = "") -> None:
+        self._ollama = ollama_client
+        self._model = model
+
     # ------------------------------------------------------------------
     # BaseAgent — required overrides
     # ------------------------------------------------------------------
@@ -52,6 +66,16 @@ class ResearchAgent(BaseAgent):
             ``{"status": "ok", "actions": [AgentAction, ...], "task": task}``
         """
         step_id = task.get("step_id", str(uuid.uuid4()))
+        model = task.get("_selected_model") or self._model
+        client = self._ollama
+
+        if client is not None and model:
+            # Primary path: LLM-driven actions -- exceptions propagate so the
+            # execution engine can retry with back-off / model fallback.
+            actions = self._llm_actions(task, context, step_id, client, model)
+            return {"status": "ok", "actions": actions, "task": task}
+
+        # Fallback only when Ollama is not configured at all.
         actions = self._generate_actions(task, step_id)
         return {"status": "ok", "actions": actions, "task": task}
 
@@ -81,7 +105,30 @@ class ResearchAgent(BaseAgent):
         )
 
     # ------------------------------------------------------------------
-    # Action generation
+    # LLM-driven action generation
+    # ------------------------------------------------------------------
+
+    def _llm_actions(
+        self,
+        task: Dict[str, Any],
+        context: Dict[str, Any],
+        step_id: str,
+        client: Any,
+        model: str,
+    ) -> List[AgentAction]:
+        description = task.get("description") or task.get("name", "")
+        project_root = context.get("project_root", "")
+        prompt = (
+            f"{_SYSTEM_PROMPT}\n\n"
+            f"Project root: {project_root}\n"
+            f"Task: {description}\n"
+        )
+        response = client.generate(model=model, prompt=prompt)
+        raw = response.get("response", "")
+        return _parse_llm_actions(raw, self.name, step_id)
+
+    # ------------------------------------------------------------------
+    # Action generation (keyword fallback)
     # ------------------------------------------------------------------
 
     def _generate_actions(self, task: Dict[str, Any], step_id: str) -> List[AgentAction]:

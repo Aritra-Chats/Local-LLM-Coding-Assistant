@@ -51,6 +51,12 @@ class ReadFileTool(Tool):
             "required": False,
             "default": "utf-8",
         },
+        "project_root": {
+            "type": "string",
+            "description": "Project root directory for resolving relative paths (injected automatically).",
+            "required": False,
+            "default": "",
+        },
     }
 
     def run(  # type: ignore[override]
@@ -59,35 +65,43 @@ class ReadFileTool(Tool):
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
         encoding: str = "utf-8",
+        project_root: str = "",
         **_: Any,
     ) -> ToolResult:
         """Read the file and return its contents.
 
         Args:
-            path: Path to the file.
+            path: Path to the file (absolute or relative to project_root).
             start_line: Optional start line (1-based).
             end_line: Optional end line (1-based).
             encoding: Text encoding.
+            project_root: Optional project root directory for resolving relative paths.
 
         Returns:
             ToolResult with ``output`` set to the file content string.
         """
-        resolved = Path(path).expanduser()
-        if not resolved.exists():
+        # Resolve path relative to project_root if provided and path is relative
+        target_path = Path(path).expanduser()
+        if project_root and not target_path.is_absolute():
+            target_path = (Path(project_root) / path).resolve()
+        else:
+            target_path = target_path.resolve()
+            
+        if not target_path.exists():
             return ToolResult(
                 tool_name=self.name,
                 success=False,
-                error=f"File not found: {resolved}",
+                error=f"File not found: {target_path}",
             )
-        if not resolved.is_file():
+        if not target_path.is_file():
             return ToolResult(
                 tool_name=self.name,
                 success=False,
-                error=f"Path is not a file: {resolved}",
+                error=f"Path is not a file: {target_path}",
             )
 
-        size = resolved.stat().st_size
-        raw = resolved.read_bytes()[:_MAX_BYTES]
+        size = target_path.stat().st_size
+        raw = target_path.read_bytes()[:_MAX_BYTES]
         truncated = size > _MAX_BYTES
 
         try:
@@ -113,7 +127,7 @@ class ReadFileTool(Tool):
             success=True,
             output=text,
             metadata={
-                "path": str(resolved),
+                "path": str(target_path),
                 "size_bytes": size,
                 "total_lines": total_lines,
                 "truncated": truncated,

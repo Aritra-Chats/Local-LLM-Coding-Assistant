@@ -18,8 +18,8 @@ Everything needed to run a fully functional, local AI assistant on consumer hard
 
 - [x] Hardware auto-detection (Minimal / Standard / Advanced modes)
 - [x] One-command bootstrap (Ollama install, model pull, workspace creation)
-- [x] 9-agent pipeline system (Supervisor, Planner, Pipeline Generator, Coding,
-      Debugging, Reasoning, DevOps, Research, System)
+- [x] 10-agent pipeline system (Supervisor, Planner, Pipeline Generator, Coding,
+      Debugging, Reasoning, DevOps, Research, System, Critic)
 - [x] 10 built-in tools (file I/O, shell, search, git, web, dependency management)
 - [x] Rich interactive REPL with slash commands
 - [x] Attachment system (`@file:`, `@url:`, `@image:`, `@pdf:`, `@snippet:`)

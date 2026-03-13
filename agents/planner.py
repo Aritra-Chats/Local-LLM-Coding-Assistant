@@ -1,7 +1,6 @@
 from __future__ import annotations
 from abc import abstractmethod
-from typing import Any, Dict, List
-
+from typing import Any, Dict, List, Optional
 from agents.base_agent import BaseAgent
 
 
@@ -83,9 +82,10 @@ Design contract
 """
 
 
+import json
 import traceback
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agents.agent_action import AgentAction
 from tasks.task_manager import (
@@ -111,22 +111,55 @@ def _complexity_from_step_count(n: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+_PLANNER_DECOMPOSE_PROMPT = """\
+You are a senior software engineer planning agent. Break down the user's goal into ordered execution steps.
+
+Goal: {goal}
+Category: {category}
+Complexity: {complexity}
+
+Respond ONLY with a valid JSON array of steps. Each step must have:
+{{
+  "name": "<short action verb phrase>",
+  "description": "<what this step does and why>",
+  "agent": "<one of: coding, debugging, reasoning, devops, research, system>",
+  "tools": ["<tool names this step will likely need>"],
+  "depends_on": []
+}}
+
+Rules:
+- Steps must be ordered (later steps depend on earlier ones)
+- Be specific and actionable - each step should do ONE thing
+- Use the most appropriate agent for each step
+- Available tools: read_file, write_file, search_code, run_shell, run_tests, git_diff, git_commit, web_search, install_dependency, open_application
+- Return between 2 and 10 steps depending on complexity
+- No prose before or after the JSON array."""
+
+
 class ConcretePlannerAgent(PlannerAgent):
     """Concrete task decomposition and agent-assignment agent.
 
-    Delegates all classification, decomposition, and plan generation to
-    :class:`~tasks.task_manager.TaskPlanner`.
+    Uses an LLM (via OllamaClient) to dynamically generate pipeline steps
+    when available.  Falls back to the keyword-based TaskPlanner when
+    Ollama is not running.
 
     Attributes:
         name: Registry identifier for this agent.
-        task_planner: The :class:`~tasks.task_manager.TaskPlanner`
-            instance used internally.
+        task_planner: Fallback :class:`~tasks.task_manager.TaskPlanner` instance.
+        ollama_client: Optional OllamaClient for LLM-driven decomposition.
+        model: Ollama model tag used for decomposition.
     """
 
     name = "planner"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        ollama_client: Optional[Any] = None,
+        model: str = "",
+    ) -> None:
         self.task_planner = TaskPlanner()
+        self._ollama = ollama_client
+        self._model = model
 
     # ------------------------------------------------------------------
     # BaseAgent — required overrides
@@ -221,19 +254,58 @@ class ConcretePlannerAgent(PlannerAgent):
     # ------------------------------------------------------------------
 
     def decompose(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Decompose *task* into subtask dicts via :class:`TaskPlanner`.
+        """Decompose *task* into subtask dicts.
+
+        When an OllamaClient is available, uses the LLM to dynamically generate
+        pipeline steps tailored to the specific goal.  Falls back to the
+        keyword-based TaskPlanner when Ollama is unavailable.
 
         Args:
             task: Structured task dict.
 
         Returns:
-            List of subtask dicts (serialised :class:`~tasks.task_manager.Subtask`).
+            List of subtask dicts with name, description, agent, tools, depends_on.
         """
-        clf = self.task_planner.classify(task.get("goal", ""))
-        subtasks = self.task_planner.decomposer.decompose(
-            task.get("goal", ""), clf, task
-        )
-        return [s.to_dict() for s in subtasks]
+        goal = task.get("goal", "")
+        category = task.get("task_category", "coding")
+        complexity = task.get("complexity", "medium")
+
+        # ── LLM-driven decomposition ───────────────────────────────────────
+        if self._ollama and self._model:
+            try:
+                llm_prompt = _PLANNER_DECOMPOSE_PROMPT.format(
+                    goal=goal, category=category, complexity=complexity
+                )
+                response = self._ollama.generate(model=self._model, prompt=llm_prompt)
+                raw = response.get("response", "").strip()
+                if raw.startswith("```"):
+                    raw = __import__("re").sub(r"^```[a-zA-Z]*\n?", "", raw).rstrip("` \n")
+                steps = json.loads(raw)
+                if isinstance(steps, list) and steps:
+                    # Normalise and add step IDs
+                    for i, step in enumerate(steps):
+                        step.setdefault("step_id", str(uuid.uuid4()))
+                        step.setdefault("index", i)
+                        step.setdefault("depends_on", [steps[j]["step_id"] for j in range(i)])
+                        step["_decomposed_by"] = "llm"
+                    return steps
+            except Exception as _llm_err:
+                # Log reason but continue to keyword-based fallback so the
+                # planner can still produce a usable (if less optimal) plan.
+                import sys
+                print(
+                    f"[PlannerAgent] LLM decomposition failed ({type(_llm_err).__name__}: "
+                    f"{_llm_err}) — falling back to keyword decomposition.",
+                    file=sys.stderr,
+                )
+
+        # ── Keyword-based fallback ─────────────────────────────────────────
+        clf = self.task_planner.classify(goal)
+        subtasks = self.task_planner.decomposer.decompose(goal, clf, task)
+        result = [s.to_dict() for s in subtasks]
+        for s in result:
+            s["_decomposed_by"] = "keyword"
+        return result
 
     def assign_agents(self, steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Ensure every step dict has an ``"agent"`` key.

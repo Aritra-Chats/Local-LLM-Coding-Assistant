@@ -5,7 +5,7 @@ Public API for the Sentinel tool system.
 Exports
 -------
 Tool classes
-    ReadFileTool, WriteFileTool, SearchCodeTool, RunShellTool, RunTestsTool,
+    ReadFileTool, WriteFileTool, SearchCodeTool, FindFilesTool, RunShellTool, RunTestsTool,
     GitDiffTool, GitCommitTool, InstallDependencyTool, WebSearchTool,
     OpenApplicationTool
 
@@ -34,6 +34,7 @@ from tools.tool_registry import (
 from tools.read_file import ReadFileTool
 from tools.write_file import WriteFileTool
 from tools.search_code import SearchCodeTool
+from tools.find_files import FindFilesTool
 from tools.run_shell import RunShellTool
 from tools.run_tests import RunTestsTool
 from tools.git_diff import GitDiffTool
@@ -52,6 +53,7 @@ __all__ = [
     "ReadFileTool",
     "WriteFileTool",
     "SearchCodeTool",
+    "FindFilesTool",
     "RunShellTool",
     "RunTestsTool",
     "GitDiffTool",
@@ -68,6 +70,7 @@ _BUILTIN_TOOLS = [
     ReadFileTool,
     WriteFileTool,
     SearchCodeTool,
+    FindFilesTool,
     RunShellTool,
     RunTestsTool,
     GitDiffTool,

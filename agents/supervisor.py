@@ -1,7 +1,12 @@
 from __future__ import annotations
+import json
+import re
+import traceback
+import uuid
 from abc import abstractmethod
 from typing import Any, Dict, List, Optional
 
+from agents.agent_action import AgentAction
 from agents.base_agent import BaseAgent
 
 
@@ -84,13 +89,6 @@ Design contract
 """
 
 
-import re
-import traceback
-import uuid
-from typing import Any, Dict, List, Optional
-
-from agents.agent_action import AgentAction
-
 # ---------------------------------------------------------------------------
 # Complexity heuristics
 # ---------------------------------------------------------------------------
@@ -127,18 +125,48 @@ def _estimate_complexity(goal: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+_SUPERVISOR_PARSE_PROMPT = """\
+You are a senior software engineering assistant. Parse the user's request and extract a structured task.
+
+User request: {prompt}
+
+Respond ONLY with a valid JSON object with these exact keys:
+{{
+  "goal": "<concise one-line summary of what needs to be done>",
+  "complexity": "<one of: low, medium, high>",
+  "constraints": ["<any stated constraints or requirements>"],
+  "task_category": "<one of: coding, debugging, reasoning, devops, research, system>",
+  "affected_files": ["<list any specific files mentioned, or empty list>"],
+  "language": "<primary programming language if relevant, else empty string>"
+}}
+
+Rules:
+- goal must be action-oriented and specific (not just a restatement)
+- complexity: low=simple change, medium=multi-file/multi-step, high=architectural/large-scale
+- No prose before or after the JSON object."""
+
+
 class ConcreteSupervisorAgent(SupervisorAgent):
     """Concrete top-level orchestrator agent.
 
     Attributes:
         name: Registry identifier for this agent.
         max_retries: Maximum number of recovery attempts before aborting.
+        ollama_client: Optional OllamaClient for LLM-driven prompt parsing.
+        model: Ollama model tag used by this agent.
     """
 
     name = "supervisor"
 
-    def __init__(self, max_retries: int = 2) -> None:
+    def __init__(
+        self,
+        max_retries: int = 2,
+        ollama_client: Optional[Any] = None,
+        model: str = "",
+    ) -> None:
         self.max_retries = max_retries
+        self._ollama = ollama_client
+        self._model = model
 
     # ------------------------------------------------------------------
     # BaseAgent — required overrides
@@ -215,31 +243,130 @@ class ConcreteSupervisorAgent(SupervisorAgent):
     def parse_prompt(self, prompt: str) -> Dict[str, Any]:
         """Parse a raw user prompt into a structured task dict.
 
-        Extracts the first sentence as the goal, detects an optional
-        ``[context: ...]`` annotation, and estimates complexity.
+        When an OllamaClient is available, uses the LLM to extract a rich
+        structured task dict (goal, complexity, task_category, constraints,
+        affected_files, language).  Falls back to regex-based extraction
+        when Ollama is unavailable or the model returns an unusable response.
+
+        Model self-healing
+        ------------------
+        If the first attempt returns HTTP 404 (model not installed) the
+        method re-queries ``/api/tags``, picks the best available installed
+        model, and retries exactly once.  This prevents the misleading
+        "LLM task parsing failed" message when the catalogue model hasn't
+        been pulled yet.
 
         Args:
             prompt: Raw user input string.
 
         Returns:
-            ``{"goal": str, "raw_prompt": str, "complexity": str, "constraints": list,
-               "step_id": str}``
+            ``{"goal": str, "raw_prompt": str, "complexity": str,
+               "constraints": list, "task_category": str,
+               "affected_files": list, "language": str, "step_id": str}``
         """
+        import sys
         prompt = prompt.strip()
+        step_id = str(uuid.uuid4())
 
-        # First sentence → goal
-        goal_match = re.match(r"([^.!?\n]+)[.!?\n]?", prompt)
+        # ── LLM-driven extraction ────────────────────────────────────────────────
+        if self._ollama and self._model:
+            # Try up to 2 times: first with self._model, then with the
+            # best actually-installed model if the first call 404s.
+            models_to_try = [self._model]
+            tried: set = set()
+
+            for attempt_model in models_to_try:
+                if attempt_model in tried:
+                    continue
+                tried.add(attempt_model)
+                try:
+                    llm_prompt = _SUPERVISOR_PARSE_PROMPT.format(prompt=prompt)
+                    response = self._ollama.generate(
+                        model=attempt_model,
+                        prompt=llm_prompt,
+                        # 60 s is enough for a 7B model on modest hardware;
+                        # prevents the process from hanging on first use.
+                        timeout=60,
+                        options={"num_predict": 512, "temperature": 0.1},
+                    )
+                    raw = response.get("response", "").strip()
+                    if raw.startswith("```"):
+                        raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw).rstrip("` \n")
+                    parsed = json.loads(raw)
+                    self._model = attempt_model  # remember working tag
+                    return {
+                        "goal":           parsed.get("goal", prompt[:200]),
+                        "raw_prompt":     prompt,
+                        "complexity":     parsed.get("complexity", "medium"),
+                        "constraints":    parsed.get("constraints", []),
+                        "task_category":  parsed.get("task_category", "coding"),
+                        "affected_files": parsed.get("affected_files", []),
+                        "language":       parsed.get("language", ""),
+                        "step_id":        step_id,
+                        "_parsed_by":     "llm",
+                        "_model_used":    attempt_model,
+                    }
+
+                except Exception as _llm_err:
+                    err_str = str(_llm_err)
+                    is_404 = (
+                        "404" in err_str
+                        or "Not Found" in err_str
+                        or "model not found" in err_str.lower()
+                    )
+
+                    if is_404 and len(tried) == 1:
+                        # Self-heal: discover installed models and retry once
+                        try:
+                            from core.model_router import ConcreteModelRouter
+                            ConcreteModelRouter.invalidate_model_cache()
+                            installed = self._ollama.list_models()
+                        except Exception:
+                            installed = []
+
+                        if installed:
+                            _pref = [
+                                "codellama", "mistral", "llama", "phi", "gemma", "qwen"
+                            ]
+                            best = installed[0]
+                            for pref in _pref:
+                                hits = [t for t in installed if pref in t.lower()]
+                                if hits:
+                                    best = hits[0]
+                                    break
+                            if best not in tried:
+                                print(
+                                    f"[SupervisorAgent] Model '{attempt_model}'"
+                                    f" not installed — retrying with '{best}'.",
+                                    file=sys.stderr,
+                                )
+                                models_to_try.append(best)
+                                continue
+
+                    # Non-404 errors (JSON parse fail, timeout, etc.) fall through
+                    print(
+                        f"[SupervisorAgent] LLM task parsing failed "
+                        f"({type(_llm_err).__name__}: {_llm_err}) "
+                        f"— falling back to rule-based parsing.",
+                        file=sys.stderr,
+                    )
+                    break
+
+        # ── Rule-based fallback ──────────────────────────────────────────────────
+        goal_match = re.match(r"([^!?\n]+)[!?\n]?", prompt)
         goal = goal_match.group(1).strip() if goal_match else prompt[:200]
-
-        # Optional inline constraints: [constraint: ...]
         constraints = re.findall(r"\[constraint:\s*([^\]]+)\]", prompt, re.IGNORECASE)
 
         return {
-            "goal": goal,
-            "raw_prompt": prompt,
-            "complexity": _estimate_complexity(goal),
-            "constraints": constraints,
-            "step_id": str(uuid.uuid4()),
+            "goal":           goal,
+            "raw_prompt":     prompt,
+            "complexity":     _estimate_complexity(goal),
+            "constraints":    constraints,
+            "task_category":  "coding",
+            "affected_files": [],
+            "language":       "",
+            "step_id":        step_id,
+            "_parsed_by":     "regex",
         }
 
     def delegate(self, task: Dict[str, Any]) -> Dict[str, Any]:

@@ -101,8 +101,10 @@ All Sentinel data is stored locally under `~/.sentinel/`:
 | Path | Contents |
 |---|---|
 | `~/.sentinel/sessions/` | Conversation history (plaintext JSON) |
+| `~/.sentinel/projects/` | Per-project metadata and exploration cache |
 | `~/.sentinel/index/` | Vector embeddings of your project files |
 | `~/.sentinel/memory/` | Persistent agent memory snapshots |
+| `~/.sentinel/metrics/` | Performance metrics per session (JSON) |
 | `~/.sentinel/logs/` | Operational logs |
 | `~/.sentinel/models/` | Model metadata cache |
 

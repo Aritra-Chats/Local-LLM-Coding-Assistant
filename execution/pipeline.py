@@ -143,14 +143,14 @@ _MODEL_HINTS: Dict[Tuple[str, str], str] = {
     ("minimal",  "system"):    "mistral:7b",
     ("standard", "coding"):    "codellama:13b",
     ("standard", "debugging"): "codellama:13b",
-    ("standard", "research"):  "mistral:13b",
-    ("standard", "reasoning"): "mistral:13b",
+    ("standard", "research"):  "mistral-nemo:12b",
+    ("standard", "reasoning"): "mistral-nemo:12b",
     ("standard", "devops"):    "codellama:13b",
     ("standard", "system"):    "mistral:7b",
     ("advanced", "coding"):    "codellama:34b",
     ("advanced", "debugging"): "deepseek-coder:33b",
-    ("advanced", "research"):  "mixtral:8x7b",
-    ("advanced", "reasoning"): "mixtral:8x7b",
+    ("advanced", "research"):  "mistral-nemo:12b",
+    ("advanced", "reasoning"): "mistral-nemo:12b",
     ("advanced", "devops"):    "codellama:34b",
     ("advanced", "system"):    "mistral:13b",
 }
@@ -158,8 +158,8 @@ _MODEL_HINTS: Dict[Tuple[str, str], str] = {
 # Default model when agent category is unknown
 _DEFAULT_MODELS: Dict[str, str] = {
     "minimal":  "mistral:7b",
-    "standard": "mistral:13b",
-    "advanced": "mixtral:8x7b",
+    "standard": "mistral-nemo:12b",
+    "advanced": "mistral-nemo:12b",
 }
 
 # ---------------------------------------------------------------------------

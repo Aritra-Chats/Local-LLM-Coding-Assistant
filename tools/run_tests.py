@@ -7,6 +7,7 @@ Registered name: ``"run_tests"``
 """
 
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -120,9 +121,24 @@ class RunTestsTool(Tool):
         interpreter = python or sys.executable
         extra_args = list(args) if args else []
 
-        resolved_path = Path(path).expanduser()
+        resolved_path = Path(path).expanduser().resolve()
 
+        # Auto-detect JS/npm projects when runner is still the default "pytest"
+        npm_cwd: Optional[Path] = None
         if runner == "pytest":
+            # Look for package.json in project root, then common subdirs
+            candidates = [resolved_path] + [resolved_path / d for d in ("client", "app", "frontend")]
+            for candidate in candidates:
+                if (candidate / "package.json").exists():
+                    npm_cwd = candidate
+                    runner = "npm"
+                    break
+
+        if runner == "npm":
+            npm_exe = shutil.which("npm") or shutil.which("npm.cmd") or "npm"
+            cwd = npm_cwd or resolved_path
+            cmd = [npm_exe, "test", "--", "--watchAll=false"] + extra_args
+        elif runner == "pytest":
             cmd = [interpreter, "-m", "pytest", str(resolved_path)] + extra_args
         elif runner == "unittest":
             cmd = [interpreter, "-m", "unittest", "discover", "-s", str(resolved_path)] + extra_args
@@ -130,14 +146,17 @@ class RunTestsTool(Tool):
             return ToolResult(
                 tool_name=self.name,
                 success=False,
-                error=f"Unknown runner '{runner}'.  Use 'pytest' or 'unittest'.",
+                error=f"Unknown runner '{runner}'.  Use 'pytest', 'unittest', or 'npm'.",
             )
+        npm_cwd = npm_cwd  # keep reference for subprocess call below
 
+        run_cwd = str(npm_cwd) if runner == "npm" and npm_cwd else None
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 timeout=timeout,
+                cwd=run_cwd,
             )
         except subprocess.TimeoutExpired:
             return ToolResult(

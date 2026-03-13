@@ -1,7 +1,8 @@
 """cli — Sentinel interactive CLI."""
 
 from cli.interface import InteractiveUI, launch, main
-from cli.display import PipelineViewer, ProgressTracker
+from cli.pipeline_viewer import PipelineViewer
+from cli.progress_tracker import ProgressTracker
 from cli.diff_viewer import DiffViewer
 from cli.command_palette import Command, CommandParser, ParsedInput
 

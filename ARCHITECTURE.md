@@ -42,7 +42,7 @@ This document describes the internal design of every Sentinel subsystem. It is i
 
 ```
 local-llm-assistant/
-├── agents/       ABC + concrete: supervisor, planner, pipeline_generator + 6 specialists
+├── agents/       ABC + concrete: supervisor, planner, pipeline_generator + 7 specialists
 ├── cli/          Interactive REPL, display, diff, command palette
 ├── config/       Hardware profile, model config, environment settings
 ├── context/      RAG engine, symbol graph, dependency graph, attachment loader
@@ -114,7 +114,8 @@ BaseAgent (ABC)  ──  agents/base_agent.py
     ├── ReasoningAgent                 ──  agents/reasoning_agent.py
     ├── DevOpsAgent                    ──  agents/devops_agent.py
     ├── ResearchAgent                  ──  agents/research_agent.py
-    └── SystemAgent                    ──  agents/system_agent.py
+    ├── SystemAgent                    ──  agents/system_agent.py
+    └── CriticAgent                    ──  agents/critic_agent.py
 ```
 
 ### `BaseAgent` interface
@@ -139,6 +140,7 @@ describe() -> str                   # human-readable agent description
 | `DevOpsAgent` | devops | Git, CI/CD, shell commands |
 | `ResearchAgent` | research | Web search, documentation lookup |
 | `SystemAgent` | system | OS operations, application control |
+| `CriticAgent` | review | Senior-reviewer pass on write_file actions before dispatch |
 
 ### `AgentAction`
 
@@ -435,8 +437,9 @@ config/hardware_profile.py   ─►  HardwareProfiler.classify(info) → Hardwar
 |---|---|---|
 | `cli/interface.py` | `InteractiveUI` | Main REPL loop using `prompt_toolkit` |
 | `cli/interface.py` | `launch()`, `main()` | Entry-point helpers |
-| `cli/display.py` | `PipelineViewer` | Rich table rendering of pipeline steps |
-| `cli/display.py` | `ProgressTracker` | Rich Live progress bar during execution |
+| `cli/pipeline_viewer.py` | `PipelineViewer` | Rich tree/table rendering of pipeline steps |
+| `cli/progress_tracker.py` | `ProgressTracker` | Rich Live progress bar during execution |
+| `cli/display.py` | re-export shim | Backward-compat re-export of `PipelineViewer` and `ProgressTracker` |
 | `cli/command_palette.py` | `CommandParser` | Slash-command registration and dispatch |
 | `cli/diff_viewer.py` | `DiffViewer` | Syntax-highlighted unified diff output |
 

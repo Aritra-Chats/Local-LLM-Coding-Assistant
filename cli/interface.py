@@ -55,6 +55,8 @@ class InteractiveUI:
         self.diff_viewer = DiffViewer(console=console)
         self.progress = ProgressTracker(console=console)
         self._running = False
+        self._runtime: Any = None   # Set from main.py for runtime-dependent commands
+        self._last_context: Any = None   # Stored after each pipeline run
         self._prompt_session: PromptSession = PromptSession(
             history=InMemoryHistory(),
             auto_suggest=AutoSuggestFromHistory(),
@@ -186,6 +188,22 @@ class InteractiveUI:
                 handler=self._cmd_exit,
                 aliases=["quit", "q"],
             ),
+            Command(
+                name="session",
+                description="Show detailed session info (ID, project, turns, hardware mode).",
+                handler=self._cmd_session,
+            ),
+            Command(
+                name="diff",
+                description="Show the diff produced by the last file edit.",
+                handler=self._cmd_diff,
+            ),
+            Command(
+                name="mode",
+                description="Show or switch the hardware mode (minimal/standard/advanced).",
+                usage="/mode [minimal|standard|advanced]",
+                handler=self._cmd_mode,
+            ),
         ]
         self.parser.register_many(commands)
 
@@ -221,26 +239,58 @@ class InteractiveUI:
         self.pipeline_viewer.render(state)
 
     def _cmd_models(self, parsed: ParsedInput) -> None:
-        console.print(
-            Panel(
-                "[dim]Model listing will be populated when ModelRouter is wired.[/dim]",
-                title="[bold cyan]Available Models[/bold cyan]",
-                border_style="cyan",
-            )
-        )
+        import json as _json
+        import urllib.request as _req
+        ollama_url = "http://localhost:11434/api/tags"
+        try:
+            with _req.urlopen(ollama_url, timeout=5) as resp:
+                data = _json.loads(resp.read().decode())
+            models = data.get("models", [])
+            if not models:
+                console.print("[dim]No models found — pull one with: ollama pull codellama:13b[/dim]")
+                return
+            table = Table(title="Available Ollama Models", border_style="cyan", show_header=True)
+            table.add_column("Model", style="bold cyan")
+            table.add_column("Size", style="dim")
+            table.add_column("Modified", style="dim")
+            for m in models:
+                name = m.get("name", "?")
+                size = f"{m.get('size', 0) // 1_000_000:.0f} MB"
+                mod  = m.get("modified_at", "")[:19]
+                table.add_row(name, size, mod)
+            console.print(table)
+        except Exception as exc:
+            console.print(f"[red]Could not reach Ollama at {ollama_url}: {exc}[/red]")
 
     def _cmd_context(self, parsed: ParsedInput) -> None:
-        console.print(
-            Panel(
-                "[dim]Context payload will be shown when ContextBuilder is wired.[/dim]",
-                title="[bold cyan]Last Step Context[/bold cyan]",
-                border_style="cyan",
-            )
-        )
+        import json as _json
+        ctx = self._last_context or self.session.metadata.get("last_context")
+        if ctx is None:
+            console.print("[dim]No context recorded yet — run a task first.[/dim]")
+            return
+        try:
+            text = _json.dumps(ctx, indent=2, default=str)
+        except Exception:
+            text = str(ctx)
+        console.print(Panel(
+            text[:4000] + ("\n[dim]…(truncated)[/dim]" if len(text) > 4000 else ""),
+            title="[bold cyan]Last Step Context[/bold cyan]",
+            border_style="cyan",
+        ))
 
     def _cmd_index(self, parsed: ParsedInput) -> None:
-        console.print("[bold yellow]Indexing project…[/bold yellow]")
-        console.print("[dim]Project indexing will be wired to the code understanding engine.[/dim]")
+        project_root = self.session.metadata.get("project_root", "")
+        if not project_root:
+            console.print("[dim]No project root known — start sentinel from a project directory.[/dim]")
+            return
+        console.print(f"[bold yellow]Indexing project at {project_root}…[/bold yellow]")
+        try:
+            from context.rag_search import RagEngine
+            engine = RagEngine(project_root=project_root)
+            count = engine.index_project()
+            console.print(f"[green]✔[/green] Indexed {count} chunks.")
+        except Exception as exc:
+            console.print(f"[yellow]Could not index: {exc}[/yellow]")
 
     def _cmd_syscheck(self, parsed: ParsedInput) -> None:
         import platform
@@ -300,6 +350,54 @@ class InteractiveUI:
             )
         except FileNotFoundError:
             console.print(f"[bold red]Session not found:[/bold red] {target_id}")
+
+    def _cmd_session(self, parsed: ParsedInput) -> None:
+        summary = self.session.summary()
+        meta = self.session.metadata or {}
+        table = Table(title="Session Details", border_style="green", show_header=False)
+        table.add_column("Key", style="bold green")
+        table.add_column("Value", style="white")
+        table.add_row("Session ID",   summary["session_id"])
+        table.add_row("Created",      summary["created_at"])
+        table.add_row("Turns",        str(summary["turn_count"]))
+        table.add_row("Project Root", meta.get("project_root", "[not set]"))
+        table.add_row("Hardware Mode",meta.get("hardware_mode", "[not set]"))
+        table.add_row("Started At",   meta.get("started_at", "[unknown]"))
+        table.add_row("Pipeline",     "Active" if summary["has_pipeline"] else "None")
+        console.print(table)
+
+    def _cmd_diff(self, parsed: ParsedInput) -> None:
+        last_diff = self.session.metadata.get("last_diff")
+        if last_diff is None:
+            console.print("[dim]No diff recorded yet — run a task that writes files first.[/dim]")
+            return
+        self.diff_viewer.render_comparison(
+            last_diff.get("old", ""),
+            last_diff.get("new", ""),
+            fromfile=last_diff.get("fromfile", "before"),
+            tofile=last_diff.get("tofile", "after"),
+            title=last_diff.get("title", "Last diff"),
+        )
+
+    def _cmd_mode(self, parsed: ParsedInput) -> None:
+        valid = ("minimal", "standard", "advanced")
+        if not parsed.args:
+            current = self.session.metadata.get("hardware_mode", "[unknown]")
+            console.print(
+                f"  Current mode: [bold cyan]{current}[/bold cyan]\n"
+                f"  To switch: /mode <{'|'.join(valid)}>\n"
+                "  Note: mode change takes effect on next restart (--mode flag)."
+            )
+            return
+        mode = parsed.args[0].lower()
+        if mode not in valid:
+            console.print(f"[red]Unknown mode '{mode}'. Choose: {', '.join(valid)}[/red]")
+            return
+        self.session.metadata["hardware_mode"] = mode
+        console.print(
+            f"[yellow]Mode set to [bold]{mode}[/bold] in session metadata.\n"
+            "Restart Sentinel with [bold]--mode " + mode + "[/bold] to apply."
+        )
 
     def _cmd_clear(self, parsed: ParsedInput) -> None:
         console.clear()
