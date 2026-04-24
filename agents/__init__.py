@@ -16,7 +16,13 @@ from typing import Dict, Any, Optional
 
 
 def build_agent_registry(model_router=None):
-    """Instantiate and return the default agent registry."""
+    """Instantiate and return the default agent registry.
+
+    Uses InferenceEngine as the LLM client when available. It is a drop-in
+    superset of OllamaClient that adds quantization hints, connection pooling,
+    KV-cache prefix warmup, speculative decoding, and optional
+    sentence-transformers / llama-cpp-python backends -- all transparent to agents.
+    """
     ollama_client = None
     coding_model = ""
     reasoning_model = ""
@@ -24,8 +30,16 @@ def build_agent_registry(model_router=None):
 
     if model_router is not None:
         try:
-            from models.ollama_client import OllamaClient
-            client = OllamaClient()
+            # Prefer InferenceEngine; fall back to OllamaClient if import fails
+            try:
+                from models.inference_engine import InferenceEngine
+                from typing import Any
+                hardware_mode = model_router.get_hardware_profile() if model_router else "standard"
+                client: Any = InferenceEngine(hardware_mode=hardware_mode)
+            except Exception:
+                from models.ollama_client import OllamaClient
+                client = OllamaClient()
+
             if client.is_available():
                 ollama_client = client
                 coding_model    = model_router.select_coding_model()

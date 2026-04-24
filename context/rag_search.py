@@ -225,23 +225,34 @@ class RAGEngine:
         except Exception:
             _ctx_cache = None
 
-        # ── Cosine search ─────────────────────────────────────────────
+        # ── Embed query ───────────────────────────────────────────────
         query_vec = self._embed_text(query)
         if query_vec is None:
             return []
 
-        scores = self._cosine_similarity(query_vec, self._vectors)
-        top_indices = np.argsort(scores)[::-1][:top_k]
+        # ── ANN / exact search ────────────────────────────────────────
+        top_indices = self._ann_search(query_vec, top_k)
 
         results = []
         for rank, idx in enumerate(top_indices, start=1):
+            i = int(idx)
+            if i < 0 or i >= len(self._chunks):
+                continue
+            # Score via exact cosine for accurate ranking of ANN candidates
+            score = float(np.dot(
+                query_vec / (np.linalg.norm(query_vec) + 1e-10),
+                self._vectors[i] / (np.linalg.norm(self._vectors[i]) + 1e-10),
+            ))
             results.append(
                 SearchResult(
-                    chunk=self._chunks[int(idx)],
-                    score=float(scores[int(idx)]),
+                    chunk=self._chunks[i],
+                    score=score,
                     rank=rank,
                 )
             )
+        results.sort(key=lambda r: r.score, reverse=True)
+        for rank, r in enumerate(results, start=1):
+            r.rank = rank
 
         # ── RAG cache write ───────────────────────────────────────────
         try:
@@ -481,7 +492,10 @@ class RAGEngine:
     # ------------------------------------------------------------------
 
     def _embed_chunks(self, chunks: List[Chunk]) -> np.ndarray:
-        """Generate embeddings for a list of chunks.
+        """Generate embeddings for a list of chunks using batched inference.
+
+        Uses EmbeddingClient.embed_batch() which fans out to sentence-transformers
+        (single forward pass) or parallel Ollama calls, whichever is faster.
 
         Args:
             chunks: List of Chunk objects to embed.
@@ -489,19 +503,32 @@ class RAGEngine:
         Returns:
             numpy float32 array of shape (len(chunks), D).
         """
+        if not chunks:
+            return np.empty((0,), dtype=np.float32)
+
+        texts = [c.content for c in chunks]
+        try:
+            from models.embedding_client import EmbeddingClient
+            ec = EmbeddingClient(
+                model=self.embedding_model,
+                base_url=_OLLAMA_BASE_URL,
+            )
+            matrix = ec.embed_batch_numpy(texts)
+            if matrix.ndim == 2 and matrix.shape[0] == len(chunks):
+                return matrix
+        except Exception:
+            pass
+
+        # Fallback: sequential single-text embedding
         vecs: List[np.ndarray] = []
         for chunk in chunks:
             vec = self._embed_text(chunk.content)
             if vec is None:
-                # Use zero vector as fallback
                 dim = vecs[0].shape[0] if vecs else 768
                 vec = np.zeros(dim, dtype=np.float32)
             vecs.append(vec)
 
-        if not vecs:
-            return np.empty((0,), dtype=np.float32)
-
-        return np.vstack(vecs).astype(np.float32)
+        return np.vstack(vecs).astype(np.float32) if vecs else np.empty((0,), dtype=np.float32)
 
     def _embed_text(self, text: str) -> Optional[np.ndarray]:
         """Call the Ollama embeddings API for a single text string.
@@ -590,6 +617,54 @@ class RAGEngine:
             ".c": "c", ".h": "c",
         }
         return mapping.get(path.suffix.lower(), "text")
+
+    # ------------------------------------------------------------------
+    # ANN search (FAISS when available, exact cosine fallback)
+    # ------------------------------------------------------------------
+
+    def _ann_search(self, query: np.ndarray, top_k: int) -> np.ndarray:
+        """Return indices of top_k nearest vectors using FAISS or exact cosine.
+
+        Builds/rebuilds the FAISS index lazily when the vector count changes.
+
+        Args:
+            query:  1D float32 query embedding.
+            top_k:  Number of results to return.
+
+        Returns:
+            1D integer array of indices into self._vectors.
+        """
+        if self._vectors is None or len(self._vectors) == 0:
+            return np.array([], dtype=np.int64)
+
+        # Lazy FAISS index build / rebuild
+        n = len(self._vectors)
+        if not hasattr(self, "_faiss_index") or self._faiss_index is None:
+            self._faiss_index_size = 0
+
+        if (
+            not hasattr(self, "_faiss_index")
+            or self._faiss_index is None
+            or getattr(self, "_faiss_index_size", 0) != n
+        ):
+            try:
+                from models.inference_engine import FAISSIndex
+                self._faiss_index = FAISSIndex(dim=self._vectors.shape[1])
+                self._faiss_index.build(self._vectors)
+                self._faiss_index_size = n
+            except Exception:
+                self._faiss_index = None
+                self._faiss_index_size = n
+
+        if self._faiss_index is not None and self._faiss_index.is_built:
+            try:
+                return self._faiss_index.search(query, top_k)
+            except Exception:
+                pass
+
+        # Exact cosine fallback
+        scores = self._cosine_similarity(query, self._vectors)
+        return np.argsort(scores)[::-1][:top_k]
 
     @staticmethod
     def _cosine_similarity(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:

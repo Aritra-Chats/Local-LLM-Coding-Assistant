@@ -18,3 +18,19 @@ psutil>=5.9
 # Imported lazily via _try_import(); gracefully skipped if not installed.
 # Install to enable @pdf: attachment support.
 pdfplumber>=0.10
+# ── Performance (optional — install for faster inference) ────────────────────
+# Persistent HTTP connection pooling + faster JSON for Ollama calls
+requests>=2.31
+
+# Sentence-transformers: in-process embedding (60-80% faster than Ollama HTTP)
+# Install: pip install sentence-transformers
+# sentence-transformers>=2.7
+
+# FAISS ANN search: sub-linear nearest-neighbour search for large RAG indices
+# CPU: pip install faiss-cpu   GPU: pip install faiss-gpu
+# faiss-cpu>=1.8
+
+# llama-cpp-python: direct GGUF inference, bypasses Ollama HTTP layer entirely
+# Install: pip install llama-cpp-python   (or with CUDA: CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python)
+# Requires SENTINEL_USE_LLAMACPP=1 and SENTINEL_LLAMACPP_MODEL=/path/to/model.gguf
+# llama-cpp-python>=0.2.85
