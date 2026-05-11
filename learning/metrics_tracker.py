@@ -545,18 +545,27 @@ class PerformanceTracker:
         latency_ms: float,
         success: bool = True,
         first_token_ms: Optional[float] = None,
+        provider: str = "",
     ) -> None:
         """Record a single model invocation.
 
         Args:
-            model:          Ollama model identifier (e.g. ``"codellama:13b"``).
+            model:          Ollama model identifier or cloud model tag.
             category:       Task category the model was invoked for.
             latency_ms:     Full response latency in milliseconds.
             success:        Whether the invocation produced a usable result.
             first_token_ms: Optional time-to-first-token in milliseconds.
+            provider:       Provider name (``"ollama_local"``, ``"ollama_cloud"``,
+                            ``"anthropic"``, ``"openai"``, ``"google"``).
+                            Included in the metric key so online and offline
+                            metrics are tracked separately.
         """
         try:
-            key = f"{model}:{category}"
+            # Include provider in the key so online/offline metrics don't mix
+            if provider and provider != "ollama_local":
+                key = f"{provider}::{model}:{category}"
+            else:
+                key = f"{model}:{category}"
             if key not in self._models:
                 self._models[key] = ModelMetric(model=model, category=category)
             self._models[key].record(success, latency_ms, first_token_ms)

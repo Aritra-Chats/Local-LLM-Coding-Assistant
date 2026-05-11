@@ -64,7 +64,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed breakdown of every subsyst
 | **Standard** | 12–20 GB | < 6 GB or none | `codellama:13b` | `mixtral:8x7b` | 2 |
 | **Advanced** | ≥ 20 GB or GPU ≥ 6 GB VRAM | Optional | `codellama:34b` | `mixtral:8x7b` | 4 |
 
-Sentinel automatically detects your hardware and selects the appropriate mode. You can override with `--mode`.
+Sentinel automatically detects your hardware and selects the appropriate mode. You can override with `--hw-mode`.
+
+On first launch, use the arrow keys to choose ONLINE or OFFLINE mode.
 
 **Embedding model** (all modes): `nomic-embed-text`
 
@@ -99,27 +101,27 @@ Alternatives that work well: `deepseek-coder`, `qwen2.5-coder`, `llama3`, `phi3`
 git clone https://github.com/Aritra-Chats/Local-LLM-Coding-Assistant.git
 cd Local-LLM-Coding-Assistant
 
-# 2. Create and activate a virtual environment
-python -m venv .venv
+# 2. Add this folder to your PATH, then open a new PowerShell window
 
-# Windows
-.venv\Scripts\activate
+# 3. Start Sentinel (bootstraps automatically on first run)
+sentinel
+On macOS / Linux make the `sentinel` script executable and add it to your PATH:
 
-# Linux / macOS
-source .venv/bin/activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Start Sentinel (bootstraps automatically on first run)
-python main.py
+```bash
+chmod +x sentinel
+sudo ln -s "$(pwd)/sentinel" /usr/local/bin/sentinel
 ```
+```
+
+If you are already inside the repository root and want a direct launch, `python main.py` still works. If you add the Sentinel folder to PATH, PowerShell can launch `sentinel` from any directory because `sentinel.bat` lives in that folder and calls `main.py` directly.
 
 On first launch, Sentinel will:
 1. Detect your hardware and select an appropriate mode
 2. Install any missing Python packages
-3. Pull the required Ollama models (this may take several minutes)
+3. Pull only the models needed for the selected launch mode
 4. Create workspace directories under `~/.sentinel/`
+
+When you choose ONLINE mode, Sentinel only pulls the supervisor/reasoning model and the embedding model. When you choose OFFLINE mode, it also pulls the local coding model used for local execution.
 
 See [INSTALLATION.md](INSTALLATION.md) for detailed setup instructions including offline installation and troubleshooting.
 
@@ -129,23 +131,26 @@ See [INSTALLATION.md](INSTALLATION.md) for detailed setup instructions including
 
 ```bash
 # Start a new session
-python main.py
+sentinel
 
 # Resume a previous session
-python main.py --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
+sentinel --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 
 # Target a specific project directory
-python main.py --project C:\code\my-api
+sentinel --project C:\code\my-api
 
 # Force a hardware mode
-python main.py --mode minimal
+sentinel --hw-mode minimal
 
 # Skip the bootstrap check (faster startup after first run)
-python main.py --no-bootstrap
+sentinel --no-bootstrap
 
-# Windows launcher
-sentinel.bat
-sentinel.bat --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
+# Force online or offline routing without the startup prompt
+sentinel --online
+sentinel --offline
+
+# PowerShell check: confirm the command is available on PATH
+Get-Command sentinel
 ```
 
 ### Slash commands inside the REPL
@@ -183,7 +188,7 @@ sentinel › Explain the dependency graph of this project
 
 ```
 local-llm-assistant/
-├── agents/          Supervisor, planner, pipeline generator + 6 specialist agents
+├── agents/          Supervisor, planner, pipeline generator + 7 specialist agents (10 total)
 ├── cli/             Interactive REPL, display helpers, diff viewer, command palette
 ├── config/          Hardware profile, model catalogue, runtime settings
 ├── context/         RAG search, symbol graph, dependency graph, attachment loader
@@ -194,10 +199,10 @@ local-llm-assistant/
 ├── models/          Ollama client, embedding client, model registry
 ├── system/          Hardware detector, dependency installer, Ollama manager
 ├── tasks/           Task planner, classifier, schema definitions
-├── tools/           12 built-in tools: read/write, search, shell, git, web, …
+├── tools/           14+ built-in tools: read/write, search, shell, git, web, project init, …
 ├── tests/           Test suite skeleton
 ├── main.py          Entry point & runtime orchestrator
-├── sentinel.bat     Windows launcher
+├── sentinel.bat     Windows launcher for PATH-based use
 ├── pyproject.toml
 └── requirements.txt
 ```

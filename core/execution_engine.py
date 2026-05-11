@@ -384,6 +384,11 @@ class ConcreteExecutionEngine(ExecutionEngine):
         self._start_time: float = 0.0
         self._progress_tracker: Optional[Any] = None  # Live UI progress tracker
 
+        # FileChangeMap — one per pipeline run, tracks all write_file outcomes
+        from core.file_change_map import FileChangeMap
+        self.file_change_map = FileChangeMap()
+        self._session_id: str = ""  # set by run_pipeline from context if available
+
     # ------------------------------------------------------------------
     # Primary public API — typed Pipeline input
     # ------------------------------------------------------------------
@@ -417,6 +422,18 @@ class ConcreteExecutionEngine(ExecutionEngine):
         run_id = str(uuid.uuid4())
         self._events = []
         self._start_time = time.monotonic()
+
+        # Capture session ID for FileChangeMap persistence
+        if hasattr(pipeline, "session_id"):
+            self._session_id = pipeline.session_id or ""
+        elif isinstance(pipeline, list) and pipeline:
+            self._session_id = next(
+                (s.get("session_id", "") for s in pipeline if isinstance(s, dict)), ""
+            )
+
+        # Reset FileChangeMap for this pipeline run
+        from core.file_change_map import FileChangeMap
+        self.file_change_map = FileChangeMap()
 
         result = PipelineRunResult(
             run_id=run_id,
@@ -610,6 +627,15 @@ class ConcreteExecutionEngine(ExecutionEngine):
             except Exception:
                 pass
 
+        # Persist FileChangeMap for this run
+        try:
+            from config.settings import SESSIONS_DIR
+            sid = self._session_id or run_id[:8]
+            fcm_path = SESSIONS_DIR / f"{sid}_file_changes.json"
+            self.file_change_map.save(fcm_path)
+        except Exception:
+            pass
+
         return result
 
     # ------------------------------------------------------------------
@@ -799,6 +825,22 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 step["_selected_model"] = model
                 step["_attempt"] = attempt
 
+                # ── Online mode: override _selected_model with the cloud/external
+                # model tag selected by OnlineModelDiscoveryEngine.  The local
+                # ConcreteModelRouter only knows about offline Ollama models, so
+                # select_model() above always returns a local tag (e.g. "codellama:13b")
+                # even in online mode.  We must override it here so agents send the
+                # correct model name to whichever provider client was injected.
+                _online_sel = (
+                    step.get("selected_model")
+                    or step.get("metadata", {}).get("selected_model")
+                )
+                if isinstance(_online_sel, dict):
+                    _online_provider = _online_sel.get("provider", "ollama_local")
+                    _online_model_tag = _online_sel.get("model", "")
+                    if _online_provider != "ollama_local" and _online_model_tag:
+                        step["_selected_model"] = _online_model_tag
+
                 # Council or solo dispatch.
                 if council and len(council) > 1:
                     # use_async_council=True enables asyncio.gather-based
@@ -832,9 +874,12 @@ class ConcreteExecutionEngine(ExecutionEngine):
                     try:
                         _model = step.get("_selected_model", "")
                         _cat = step.get("task_category") or step.get("category") or step.get("agent", "")
+                        _sel = step.get("selected_model") or step.get("metadata", {}).get("selected_model") or {}
+                        _provider = _sel.get("provider", "ollama_local") if isinstance(_sel, dict) else "ollama_local"
                         self._tracker.record_model_call(
                             model=_model, category=str(_cat),
                             latency_ms=elapsed_ms, success=True,
+                            provider=_provider,
                         )
                         self._tracker.record_tool_results(tool_results)
                     except Exception:
@@ -873,9 +918,12 @@ class ConcreteExecutionEngine(ExecutionEngine):
                         _model = step.get("_selected_model", "")
                         _cat = step.get("task_category") or step.get("category") or step.get("agent", "")
                         _elapsed = (time.monotonic() - step_start) * 1000
+                        _sel = step.get("selected_model") or step.get("metadata", {}).get("selected_model") or {}
+                        _provider = _sel.get("provider", "ollama_local") if isinstance(_sel, dict) else "ollama_local"
                         self._tracker.record_model_call(
                             model=_model, category=str(_cat),
                             latency_ms=_elapsed, success=False,
+                            provider=_provider,
                         )
                     except Exception:
                         pass
@@ -923,7 +971,40 @@ class ConcreteExecutionEngine(ExecutionEngine):
         )
 
     # ------------------------------------------------------------------
-    # Solo and council dispatch
+    # Inference client resolver (online mode)
+    # ------------------------------------------------------------------
+
+    def _resolve_inference_client(self, provider: str, model_tag: str) -> Optional[Any]:
+        """Return the appropriate inference client for a provider.
+
+        Returns ``None`` for ``"ollama_local"`` (agents use their default
+        client in that case) or when the client cannot be constructed.
+
+        Args:
+            provider:  One of ``"ollama_local"``, ``"ollama_cloud"``,
+                       ``"anthropic"``, ``"openai"``, ``"google"``.
+            model_tag: Model identifier (used only for validation/logging).
+
+        Returns:
+            An inference client instance, or ``None``.
+        """
+        import os
+        if provider == "ollama_local" or not provider:
+            return None
+        if provider == "ollama_cloud":
+            try:
+                from models.ollama_cloud_client import OllamaCloudClient
+                return OllamaCloudClient(api_key=os.environ.get("OLLAMA_API_KEY", ""))
+            except Exception:
+                return None
+        if provider in ("anthropic", "openai", "google"):
+            try:
+                from models.external_api_client import ExternalAPIClient
+                return ExternalAPIClient(provider)
+            except Exception:
+                return None
+        return None
+
     # ------------------------------------------------------------------
 
     def _run_solo(
@@ -947,6 +1028,19 @@ class ConcreteExecutionEngine(ExecutionEngine):
         agent = self._agents.get(agent_name)
         if agent is None:
             raise RuntimeError(f"No agent registered for '{agent_name}'.")
+
+        # ── Online mode: inject provider-specific inference client ─────
+        selected = step.get("selected_model") or step.get("metadata", {}).get("selected_model")
+        if selected:
+            try:
+                import os
+                provider = selected.get("provider", "ollama_local")
+                model_tag = selected.get("model", "")
+                client_obj = self._resolve_inference_client(provider, model_tag)
+                if client_obj is not None and hasattr(agent, "use_client"):
+                    agent.use_client(client_obj)
+            except Exception:
+                pass  # Never break execution for client injection errors
 
         output = agent.run(step, context)
         actions: List[AgentAction] = output.get("actions", [])
@@ -1336,6 +1430,15 @@ class ConcreteExecutionEngine(ExecutionEngine):
             if action.action_type == "tool_call":
                 tool_name = action.payload.get("tool", "")
                 params = action.payload.get("params", {})
+
+                # ── FileChangeMap: resolve logical→absolute before dispatch ──
+                if "path" in params and tool_name in (
+                    "read_file", "write_file", "search_code", "find_files", "run_tests"
+                ):
+                    resolved_abs = self.file_change_map.resolve(params["path"])
+                    if resolved_abs:
+                        params = {**params, "path": resolved_abs}
+
                 # ── Semantic validation ──────────────────────────────────
                 try:
                     from core.validator import validate_tool_call
@@ -1380,6 +1483,30 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 result = self._invoke_tool(tool_name, params, action, context)
                 tool_results.append(result)
                 event_data["tool_result"] = result
+
+                # ── FileChangeMap: record successful write_file ──────────
+                if tool_name == "write_file" and result.get("success"):
+                    try:
+                        import time as _time
+                        from core.file_change_map import FileChangeEvent
+                        logical_path = action.payload.get("params", {}).get("path", "")
+                        absolute_path = (
+                            result.get("metadata", {}).get("path")
+                            or logical_path
+                        )
+                        from pathlib import Path as _Path
+                        existed_before = _Path(absolute_path).exists() if absolute_path else False
+                        operation = "modify" if existed_before else "create"
+                        self.file_change_map.record(FileChangeEvent(
+                            logical_path=logical_path,
+                            absolute_path=absolute_path,
+                            operation=operation,
+                            step_id=action.step_id or "",
+                            agent=action.agent or "",
+                            timestamp_ms=int(_time.time() * 1000),
+                        ))
+                    except Exception:
+                        pass  # Never break execution for telemetry
 
             elif action.action_type == "abort":
                 event_data["abort_reason"] = action.payload.get("reason", "")

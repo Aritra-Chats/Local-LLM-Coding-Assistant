@@ -23,50 +23,54 @@ Complete reference for running Sentinel, using the interactive REPL, and integra
 ## 1. Starting Sentinel
 
 ```bash
-# From the project root, with the virtualenv active:
-python main.py
-
-# Windows launcher (handles venv activation automatically):
-sentinel.bat
+# After putting the Sentinel folder on PATH:
+sentinel
 ```
 
 On first launch, Sentinel runs its bootstrap sequence (hardware detection, model pulling, workspace setup). Subsequent launches skip this and start in a few seconds.
+
+If you are already inside the project root and have the virtual environment active, python main.py still works as a direct fallback.
+
+If PowerShell says the command is not recognized, verify that the Sentinel folder is on PATH and that sentinel.bat exists in that folder. The batch file is what launches main.py.
 
 ---
 
 ## 2. Command-Line Arguments
 
 ```
-python main.py [OPTIONS]
+sentinel [OPTIONS]
 ```
 
 | Argument | Type | Description |
 |---|---|---|
 | `--resume SESSION_ID` | string | Resume a previous session by its ID |
 | `--project PATH` | path | Set the project root Sentinel operates on (default: current directory) |
-| `--mode MODE` | `minimal` \| `standard` \| `advanced` | Override the auto-detected hardware mode |
+| `--hw-mode MODE` | `minimal` \| `standard` \| `advanced` | Override the auto-detected hardware mode |
+| `--mode MODE` | `minimal` \| `standard` \| `advanced` | Legacy alias for `--hw-mode` |
+| `--online` | flag | Force online mode and skip the connectivity prompt |
+| `--offline` | flag | Force offline mode and skip the connectivity prompt |
 | `--no-bootstrap` | flag | Skip the bootstrap sequence (faster startup) |
 
 ### Examples
 
 ```bash
 # New session on the current directory
-python main.py
+sentinel
 
 # Resume a previous session
-python main.py --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
+sentinel --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 
 # Assist a specific project
-python main.py --project C:\code\my-api
+sentinel --project C:\code\my-api
 
 # Force minimal mode on a constrained machine
-python main.py --mode minimal
+sentinel --hw-mode minimal
 
 # Fast startup (bootstrap already done)
-python main.py --no-bootstrap
+sentinel --no-bootstrap
 
 # Combine flags
-python main.py --project ./my-project --mode standard --no-bootstrap
+sentinel --project ./my-project --hw-mode standard --no-bootstrap
 ```
 
 ---
@@ -165,6 +169,22 @@ sentinel › Write unit tests for the UserService class in src/services/user.py
 sentinel › First read the README, then add a docker-compose.yml that matches the setup instructions
 ```
 
+### Project initialization examples
+
+Use Sentinel to scaffold new projects with `project_initializer` automatically invoked:
+
+```
+sentinel › Create a new FastAPI project with SQLAlchemy models and Alembic migrations
+
+sentinel › Scaffold a React + TypeScript app with Vite and Tailwind CSS
+
+sentinel › Initialize a Python CLI tool with Click framework and unit tests
+
+sentinel › Set up a new Next.js full-stack app with authentication and database models
+```
+
+Sentinel will automatically select appropriate project templates, install dependencies, and generate initial file structure based on your description.
+
 ---
 
 ## 6. Session Management
@@ -180,7 +200,7 @@ Session ID: 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 ### Resume a session
 
 ```bash
-python main.py --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
+sentinel --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 ```
 
 Or from within the REPL:
@@ -260,7 +280,7 @@ Sentinel auto-detects your hardware on startup. You can view the detected mode i
 ### Override for one session
 
 ```bash
-python main.py --mode minimal
+sentinel --hw-mode minimal
 ```
 
 ### Override at runtime
@@ -270,6 +290,67 @@ sentinel › /mode standard
 ```
 
 `/mode` updates the current session metadata. Restart Sentinel with `--mode` to apply the mode change to model routing.
+
+---
+
+## 9. Hardware Modes
+
+Sentinel auto-detects your hardware on startup. You can view the detected mode in the startup output or check it with `/session`.
+
+| Mode | RAM | Models used | Pipeline concurrency |
+|---|---|---|---|
+| **minimal** | 8–12 GB | `codellama:7b` + `mistral:7b` | 1 (sequential) |
+| **standard** | 12–20 GB | `codellama:13b` + `mixtral:8x7b` | 2 |
+| **advanced** | ≥ 20 GB or GPU | `codellama:34b` + `mixtral:8x7b` | 4 |
+
+### Override for one session
+
+```bash
+sentinel --hw-mode minimal
+```
+
+### Override at runtime
+
+```
+sentinel › /mode standard
+```
+
+`/mode` updates the current session metadata. Restart Sentinel with `--mode` to apply the mode change to model routing.
+
+---
+
+## 9.1. Online and Offline Modes
+
+Sentinel can operate in two connectivity modes:
+
+| Mode | Behavior | When to use |
+|---|---|---|
+| **online** | Routes complex reasoning tasks to larger cloud models (if available); falls back to local models | When you have API access and want higher quality reasoning |
+| **offline** | All tasks run on local Ollama models only; 100% data privacy | Default; recommended for secure environments or when API access unavailable |
+
+### Choose at startup (interactive)
+
+On first launch, Sentinel prompts you to choose:
+
+```
+╭─ Connectivity Mode ─╮
+│ Select one:         │
+│ › Online            │
+│   Offline           │
+╰─────────────────────╯
+```
+
+### Force a mode with flags
+
+```bash
+sentinel --online
+sentinel --offline
+sentinel --online --hw-mode standard
+```
+
+### Switch at runtime
+
+Currently requires restarting Sentinel. The mode is persisted per session; use `--resume` to keep the same mode.
 
 ---
 
@@ -292,7 +373,7 @@ Set these in `.env` (copy from `.env.example`) or in your shell environment.
 ### Use `--project` to keep Sentinel focused
 
 ```bash
-python main.py --project ./my-api
+sentinel --project ./my-api
 ```
 
 Sentinel will index and search only that directory, giving much more relevant context.
@@ -302,7 +383,7 @@ Sentinel will index and search only that directory, giving much more relevant co
 After the first run, bootstrap is unnecessary:
 
 ```bash
-python main.py --no-bootstrap
+sentinel --no-bootstrap
 ```
 
 Add this to your shell alias:
@@ -317,11 +398,11 @@ For large refactors or multi-day features, save your session ID and resume:
 
 ```bash
 # Day 1
-python main.py
+sentinel
 # note the session ID: 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 
 # Day 2
-python main.py --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
+sentinel --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
 ```
 
 ### Let Sentinel self-correct
@@ -340,7 +421,7 @@ Sentinel incorporates context from the previous pipeline.
 For research or explanation tasks that don't need heavy models:
 
 ```bash
-python main.py --mode minimal
+sentinel --hw-mode minimal
 
 sentinel › Explain what a context manager is in Python
 sentinel › What does the walrus operator do?

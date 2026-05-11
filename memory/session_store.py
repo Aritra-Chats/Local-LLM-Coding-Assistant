@@ -57,6 +57,8 @@ class SessionManager:
     def save(self) -> None:
         """Persist the current session state to disk as JSON."""
         _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        # Record the FileChangeMap path so it can be found later
+        fcm_path = str(_SESSIONS_DIR / f"{self.session_id}_file_changes.json")
         payload = {
             "session_id": self.session_id,
             "created_at": self.created_at,
@@ -64,6 +66,7 @@ class SessionManager:
             "pipeline_state": self.pipeline_state,
             "active_task": self.active_task,
             "metadata": self.metadata,
+            "file_change_map_path": fcm_path,
         }
         self._session_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 

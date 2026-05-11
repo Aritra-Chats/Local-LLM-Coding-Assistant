@@ -111,10 +111,15 @@ class Bootstrap:
     # Public entry point
     # ------------------------------------------------------------------
 
-    def run(self) -> HardwareProfile:
+    def run(self, launch_mode: str = "offline") -> HardwareProfile:
         """Execute the full bootstrap sequence.
 
         Skips the full sequence on subsequent launches unless force=True.
+
+        Args:
+            launch_mode: Resolved startup mode. Online mode only pulls the
+                supervisor and embedding models on first launch; offline mode
+                pulls the local language and embedding models.
 
         Returns:
             The resolved HardwareProfile for this machine.
@@ -123,7 +128,10 @@ class Bootstrap:
             RuntimeError: If a critical bootstrap step fails.
         """
         if _BOOTSTRAP_STAMP.exists() and not self.force:
-            return self._fast_path()
+            profile = self._fast_path()
+            self.profile = profile
+            self._ensure_mode_models(launch_mode)
+            return profile
 
         console.print(
             Panel(
@@ -135,8 +143,7 @@ class Bootstrap:
         self._step1_detect_hardware()
         self._step2_install_python_deps()
         self._step3_install_ollama()
-        self._step4_pull_language_models()
-        self._step5_pull_embedding_models()
+        self._ensure_mode_models(launch_mode)
         self._step6_create_workspace()
         self._step7_build_project_index()
 
@@ -267,17 +274,15 @@ class Bootstrap:
     # Step 4 — Language models
     # ------------------------------------------------------------------
 
-    def _step4_pull_language_models(self) -> None:
-        """Step 4: Pull language models appropriate for the hardware profile."""
+    def _step4_pull_language_models(self, launch_mode: str) -> None:
+        """Step 4: Pull language models appropriate for the startup mode."""
         assert self.profile is not None
 
-        models_to_pull = [
-            self.profile.recommended_model,
-            self.profile.reasoning_model,
-        ]
-        # Deduplicate
-        models_to_pull = list(dict.fromkeys(models_to_pull))
-        self._pull_models(models_to_pull, label="language model")
+        models_to_pull = [self.profile.reasoning_model]
+        if launch_mode != "online":
+            models_to_pull.insert(0, self.profile.recommended_model)
+
+        self._pull_models(list(dict.fromkeys(models_to_pull)), label="language model")
 
     # ------------------------------------------------------------------
     # Step 5 — Embedding models
@@ -287,6 +292,25 @@ class Bootstrap:
         """Step 5: Pull the embedding model required for RAG search."""
         assert self.profile is not None
         self._pull_models([self.profile.embedding_model], label="embedding model")
+
+    def _ensure_mode_models(self, launch_mode: str) -> None:
+        """Ensure the model set required for the selected launch mode exists.
+
+        Online mode:  only the embedding model is pulled locally — language
+                      inference is handled by cloud providers, so there is no
+                      need to download large local LLMs on first launch.
+        Offline mode: pull both the recommended coding model and the reasoning
+                      model so that all inference can run without internet.
+        """
+        if launch_mode == "online":
+            console.print(
+                "  [dim]Online mode — skipping local language model download.[/dim]\n"
+                "  [dim]Only the embedding model is required locally.[/dim]"
+            )
+            self._step5_pull_embedding_models()
+        else:
+            self._step4_pull_language_models(launch_mode)
+            self._step5_pull_embedding_models()
 
     # ------------------------------------------------------------------
     # Step 6 — Workspace directories

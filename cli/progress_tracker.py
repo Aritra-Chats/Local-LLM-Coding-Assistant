@@ -10,20 +10,43 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, List, Optional
 
-from rich.console import Console
-from rich.live import Live
-from rich.panel import Panel
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskID,
-    TextColumn,
-    TimeElapsedColumn,
-)
-from rich.table import Table
-from rich.text import Text
+# BUG-4 fix: Rich is an optional dependency.  If it is not installed the
+# entire module still imports and every method degrades gracefully to a
+# no-op.  All failure paths ensure self._progress_tracker is explicitly
+# set to None so that callers can safely test ``if tracker is not None``.
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TaskID,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+    from rich.table import Table
+    from rich.text import Text
+    from rich.tree import Tree as RichTree
+    _RICH_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _RICH_AVAILABLE = False
+    # Stub out types so the rest of the module can reference them safely.
+    Console = None          # type: ignore[assignment,misc]
+    Live = None             # type: ignore[assignment,misc]
+    Panel = None            # type: ignore[assignment,misc]
+    Progress = None         # type: ignore[assignment,misc]
+    SpinnerColumn = None    # type: ignore[assignment,misc]
+    BarColumn = None        # type: ignore[assignment,misc]
+    MofNCompleteColumn = None  # type: ignore[assignment,misc]
+    TextColumn = None       # type: ignore[assignment,misc]
+    TimeElapsedColumn = None  # type: ignore[assignment,misc]
+    TaskID = None           # type: ignore[assignment,misc]
+    Table = None            # type: ignore[assignment,misc]
+    Text = None             # type: ignore[assignment,misc]
+    RichTree = None         # type: ignore[assignment,misc]
 
 
 class ProgressTracker:
@@ -38,13 +61,44 @@ class ProgressTracker:
 
         Args:
             console: Optional Rich Console. Creates a new one if not provided.
+                     If Rich is unavailable, all methods degrade to no-ops and
+                     ``self._progress_tracker`` is set to ``None``.
         """
-        self.console = console or Console()
+        # BUG-4 fix: initialise _progress_tracker unconditionally so that
+        # every code path (Rich present, Rich missing, constructor exception)
+        # leaves the attribute in a known state and prevents AttributeError.
+        self._progress_tracker: Optional[Any] = None
+
+        if not _RICH_AVAILABLE:  # pragma: no cover
+            self.console = None
+            self._progress: Optional[Any] = None
+            self._live: Optional[Any] = None
+            self._task_ids: Dict[str, Any] = {}
+            self._step_timings: Dict[str, float] = {}
+            self._pipeline_task_id: Optional[Any] = None
+            # _node_task_ids used by tree-display methods (Part 5)
+            self._node_task_ids: Dict[str, Any] = {}
+            return
+
+        try:
+            self.console = console or Console()
+        except Exception:  # pragma: no cover
+            self.console = None
+            self._progress = None
+            self._live = None
+            self._task_ids = {}
+            self._step_timings = {}
+            self._pipeline_task_id = None
+            self._node_task_ids = {}
+            return
+
         self._progress: Optional[Progress] = None
         self._live: Optional[Live] = None
         self._task_ids: Dict[str, TaskID] = {}
         self._step_timings: Dict[str, float] = {}
         self._pipeline_task_id: Optional[TaskID] = None
+        # Tracks Rich task IDs for tree node status updates (Part 5)
+        self._node_task_ids: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Pipeline-level progress
@@ -108,20 +162,27 @@ class ProgressTracker:
     # Step-level updates
     # ------------------------------------------------------------------
 
-    def start_step(self, step_index: int, description: str) -> None:
+    def start_step(self, step_index: int, description: str, provider: str = "", model: str = "") -> None:
         """Mark a step as active in the live display.
 
         Args:
-            step_index: The step's pipeline index.
+            step_index:  The step's pipeline index.
             description: Human-readable step description.
+            provider:    Optional provider name for online mode display.
+            model:       Optional model tag for online mode display.
         """
         key = str(step_index)
         self._step_timings[key] = time.monotonic()
 
+        # Build display label
+        label = f"  ◉ [{step_index}] {description}"
+        if provider and provider != "ollama_local":
+            label += f" [dim]→ {provider}:{model}[/dim]"
+
         if self._progress and key in self._task_ids:
             self._progress.update(
                 self._task_ids[key],
-                description=f"  ◉ [{step_index}] {description}",
+                description=label,
                 visible=True,
             )
 
@@ -212,6 +273,7 @@ class ProgressTracker:
         table.add_column("#", width=4, style="dim")
         table.add_column("Step", style="white")
         table.add_column("Agent", style="dim")
+        table.add_column("Provider : Model", style="dim")
         table.add_column("Status", width=12)
         table.add_column("Time", width=8, style="dim")
 
@@ -230,6 +292,17 @@ class ProgressTracker:
             else:
                 time_str = "—"
 
+            # Provider / model from online mode selected_model metadata
+            sel = (step.get("metadata") or {}).get("selected_model") or {}
+            provider_str = sel.get("provider", "")
+            model_str = sel.get("model", "")
+            if provider_str and provider_str != "ollama_local":
+                prov_display = f"{provider_str}:{model_str[:20]}" if model_str else provider_str
+            elif provider_str == "ollama_local" and model_str:
+                prov_display = f"local:{model_str[:20]}"
+            else:
+                prov_display = step.get("agent", "—")
+
             if status in ("success", "completed"):
                 total_success += 1
                 status_text = Text("✔ completed", style="bold green")
@@ -245,6 +318,7 @@ class ProgressTracker:
                 str(idx),
                 step.get("description", "—")[:60],
                 step.get("agent", "—"),
+                prov_display,
                 status_text,
                 time_str,
             )
@@ -295,3 +369,113 @@ class ProgressTracker:
                 yield
             finally:
                 progress.update(tid, completed=1)
+
+    # ------------------------------------------------------------------
+    # Tree decomposition display (Part 5)
+    # ------------------------------------------------------------------
+
+    def display_tree(self, tree: Any) -> None:  # tree: TaskDecompositionTree
+        """Render the decomposition tree as an indented Rich Tree widget.
+
+        Called once before tree execution begins.  Each node shows its
+        ``node_id`` (first 8 chars), ``domain``, ``complexity``, and whether
+        it is a leaf or has children.
+
+        Args:
+            tree: A :class:`~core.task_tree.TaskDecompositionTree` instance.
+        """
+        if not _RICH_AVAILABLE or self.console is None:  # pragma: no cover
+            return
+        try:
+            from rich.tree import Tree as RichTree
+
+            def _add_node(rich_parent: Any, node: Any) -> None:
+                domain = node.task_dict.get("routing_domain",
+                                            node.task_dict.get("domain", "?"))
+                complexity = node.complexity()
+                leaf_label = "leaf" if node.is_leaf() else f"{len(node.children)} children"
+                label = (
+                    f"[dim]{node.node_id[:8]}[/dim]  "
+                    f"[cyan]{domain}[/cyan]  |  "
+                    f"[yellow]{complexity}[/yellow]  →  {leaf_label}"
+                )
+                branch = rich_parent.add(label)
+                for child in node.children:
+                    _add_node(branch, child)
+
+            root_domain = tree.root.task_dict.get(
+                "routing_domain", tree.root.task_dict.get("domain", "root"))
+            rich_tree = RichTree(
+                f"[bold green]Task Tree[/bold green]  "
+                f"[dim]{tree.root.node_id[:8]}[/dim]  "
+                f"[cyan]{root_domain}[/cyan]"
+            )
+            for child in tree.root.children:
+                _add_node(rich_tree, child)
+
+            from rich.panel import Panel as _Panel
+            self.console.print(_Panel(rich_tree, title="Decomposition Tree",
+                                      border_style="cyan", expand=False))
+        except Exception:  # pragma: no cover
+            pass
+
+    def update_node_status(
+        self,
+        node_id: str,
+        status: str,
+        message: str = "",
+    ) -> None:
+        """Update the live display of a tree node's status during execution.
+
+        Status values map to Rich styles:
+
+        =========== ========================
+        Status       Style
+        =========== ========================
+        pending      dim white
+        running      yellow (with spinner)
+        unit_tested  green
+        integrated   bold green
+        failed       bold red
+        =========== ========================
+
+        Args:
+            node_id: The :attr:`~core.task_tree.TaskNode.node_id` to update.
+            status:  One of ``"pending"``, ``"running"``, ``"unit_tested"``,
+                     ``"integrated"``, ``"failed"``.
+            message: Optional human-readable detail appended to the label.
+        """
+        if not _RICH_AVAILABLE or self.console is None:  # pragma: no cover
+            return
+
+        _STATUS_STYLES: Dict[str, str] = {
+            "pending":     "dim white",
+            "running":     "yellow",
+            "unit_tested": "green",
+            "integrated":  "bold green",
+            "failed":      "bold red",
+        }
+        _STATUS_ICONS: Dict[str, str] = {
+            "pending":     "○",
+            "running":     "◉",
+            "unit_tested": "✔",
+            "integrated":  "✔✔",
+            "failed":      "✘",
+        }
+        style = _STATUS_STYLES.get(status, "white")
+        icon = _STATUS_ICONS.get(status, "?")
+        suffix = f"  [dim]{message}[/dim]" if message else ""
+        label = f"[{style}]{icon} {node_id[:8]} — {status}{suffix}[/{style}]"
+
+        if self._progress and node_id in self._node_task_ids:
+            self._progress.update(
+                self._node_task_ids[node_id],
+                description=label,
+                visible=True,
+            )
+        else:
+            # Fallback: print directly when no live progress is active
+            try:
+                self.console.print(label)
+            except Exception:  # pragma: no cover
+                pass

@@ -1,5 +1,15 @@
 """inference_engine.py — Sentinel high-performance inference engine.
 
+Storage note
+------------
+Sentinel directs all locally-pulled Ollama models to
+``~/.sentinel/.ollama/models/`` by setting the ``OLLAMA_MODELS`` environment
+variable before any subprocess or daemon call.  This path is defined in
+``config.settings.SENTINEL_OLLAMA_MODELS`` and injected in
+``core.bootstrap.Bootstrap.run()``.  This engine wraps ``OllamaClient`` which
+connects to the local Ollama daemon at ``http://localhost:11434``; the daemon
+reads ``OLLAMA_MODELS`` at startup.
+
 Wraps OllamaClient with a layered set of speed improvements that preserve
 full output accuracy:
 

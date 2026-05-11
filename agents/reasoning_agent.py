@@ -37,7 +37,7 @@ class ReasoningAgent(BaseAgent):
     def run(self, task: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         step_id = task.get("step_id", str(uuid.uuid4()))
         model = task.get("_selected_model") or self._model
-        client = self._ollama
+        client = self._inference_client or self._ollama
 
         if client is not None and model:
             # Primary path: LLM-driven actions — exceptions propagate so the

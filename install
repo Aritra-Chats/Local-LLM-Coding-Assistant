@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Sentinel Installer — Linux / macOS
+#  Run once from the project directory.
+#
+#  What this script does:
+#    1. Checks Python 3.10+ is installed
+#    2. Creates .venv and installs requirements.txt
+#    3. Adds the project directory to PATH  (~/.bashrc / ~/.zshrc)
+#    4. Registers a daily cron job for Ollama Cloud model discovery
+#    5. Generates  uninstall  (for clean removal)
+#    6. Self-deletes
+# =============================================================================
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SOURCE" ]; do
+    _DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+    SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+    [[ "$SCRIPT_SOURCE" != /* ]] && SCRIPT_SOURCE="$_DIR/$SCRIPT_SOURCE"
+done
+PROJECT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+
+SENTINEL_HOME="${SENTINEL_HOME:-$HOME/.sentinel}"
+VENV_DIR="$PROJECT_DIR/.venv"
+PROBE_SCRIPT="$PROJECT_DIR/scripts/cloud_model_probe.py"
+PROBE_WRAPPER="$PROJECT_DIR/scripts/probe_runner.sh"
+CRON_TAG="# sentinel-cloud-probe"
+LOG_FILE="$SENTINEL_HOME/logs/probe.log"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+_green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
+_yellow() { printf '\033[0;33m%s\033[0m\n' "$*"; }
+_red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }
+_bold()   { printf '\033[1m%s\033[0m\n'   "$*"; }
+
+_step() { echo; printf '  [%s] %s\n' "$1" "$2"; }
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+clear || true
+echo
+echo "  ================================================================="
+_bold "   SENTINEL INSTALLER  |  $(uname -s)"
+echo "  ================================================================="
+echo
+echo "   Project directory : $PROJECT_DIR"
+echo "   Sentinel home     : $SENTINEL_HOME"
+echo
+echo "   This installer will:"
+echo "     [1] Check / install Python 3.10+"
+echo "     [2] Create venv + install requirements.txt"
+echo "     [3] Add project directory to PATH (bashrc / zshrc)"
+echo "     [4] Register a daily cron job for cloud model discovery"
+echo "     [5] Generate the  uninstall  script"
+echo "     [6] Delete this install script"
+echo
+echo "  -----------------------------------------------------------------"
+echo
+
+# Confirmation
+read -r -p "   Continue? [Y/n] " _CONFIRM
+case "${_CONFIRM,,}" in
+    n|no) echo; echo "   Installation cancelled."; exit 0 ;;
+    *) ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Step 1: Locate Python 3.10+
+# ---------------------------------------------------------------------------
+_step "1/6" "Checking Python 3.10+..."
+
+PYTHON=""
+for _cmd in python3.13 python3.12 python3.11 python3.10 python3 python; do
+    if command -v "$_cmd" >/dev/null 2>&1; then
+        _VER=$("$_cmd" -c "import sys; print(sys.version_info[:2])" 2>/dev/null || echo "(0, 0)")
+        if "$_cmd" -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
+            PYTHON="$_cmd"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON" ]; then
+    _red "   ERROR: Python 3.10+ not found."
+    echo
+    echo "   Install it and re-run this script:"
+    echo "     macOS  :  brew install python"
+    echo "     Ubuntu :  sudo apt install python3.12"
+    echo "     Fedora :  sudo dnf install python3.12"
+    exit 1
+fi
+
+_PY_VER=$("$PYTHON" --version 2>&1)
+echo "         Found: $_PY_VER  ($PYTHON)"
+
+# ---------------------------------------------------------------------------
+# Step 2: Create venv + install requirements
+# ---------------------------------------------------------------------------
+_step "2/6" "Setting up virtual environment and requirements..."
+
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    echo "         Creating .venv..."
+    "$PYTHON" -m venv "$VENV_DIR"
+fi
+
+VENV_PY="$VENV_DIR/bin/python"
+VENV_PIP="$VENV_DIR/bin/pip"
+
+"$VENV_PY" -m pip install --upgrade pip --quiet
+"$VENV_PY" -m pip install -r "$PROJECT_DIR/requirements.txt" --quiet
+echo "         Done."
+
+# ---------------------------------------------------------------------------
+# Step 3: Add project directory to PATH
+# ---------------------------------------------------------------------------
+_step "3/6" "Adding Sentinel to PATH..."
+
+_PATH_LINE="export PATH=\"\$PATH:$PROJECT_DIR\"  $CRON_TAG"
+
+_added=0
+for _RC in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+    # Only modify files that exist, or bashrc/zshrc (create if absent)
+    if [ "$_RC" = "$HOME/.bashrc" ] || [ "$_RC" = "$HOME/.zshrc" ] || [ -f "$_RC" ]; then
+        if ! grep -qF "$PROJECT_DIR" "$_RC" 2>/dev/null; then
+            echo >> "$_RC"
+            echo "$_PATH_LINE" >> "$_RC"
+            echo "         Added to $_RC"
+            _added=1
+        fi
+    fi
+done
+[ "$_added" -eq 0 ] && echo "         Already in PATH — skipped."
+
+# ---------------------------------------------------------------------------
+# Step 4: Create Sentinel home dirs and probe_runner.sh
+# ---------------------------------------------------------------------------
+mkdir -p "$SENTINEL_HOME/logs"
+
+_step "4/6" "Setting up daily cloud model discovery (cron)..."
+
+cat > "$PROBE_WRAPPER" << WRAPPER_EOF
+#!/usr/bin/env bash
+# probe_runner.sh — generated by installer (absolute paths baked in)
+# Called by cron daily at 06:00.
+VENV_PY="$VENV_DIR/bin/python"
+PROBE_SCRIPT="$PROBE_SCRIPT"
+LOG="$LOG_FILE"
+mkdir -p "\$(dirname "\$LOG")"
+[ -x "\$VENV_PY" ] || VENV_PY=python3
+"\$VENV_PY" "\$PROBE_SCRIPT" >> "\$LOG" 2>&1
+WRAPPER_EOF
+chmod +x "$PROBE_WRAPPER"
+
+# Register cron job (replace existing entry if present)
+_CRON_CMD="0 6 * * * \"$PROBE_WRAPPER\" $CRON_TAG"
+( crontab -l 2>/dev/null | grep -v "$CRON_TAG"; echo "$_CRON_CMD" ) | crontab -
+
+echo "         Cron job registered — runs daily at 06:00."
+echo "         Logs: $LOG_FILE"
+
+# Run an initial probe if OLLAMA_API_KEY is already configured
+_HAS_KEY=""
+if [ -f "$SENTINEL_HOME/.env" ]; then
+    if grep -Eq '^OLLAMA_API_KEY=.+' "$SENTINEL_HOME/.env" 2>/dev/null; then
+        _HAS_KEY=1
+    fi
+fi
+[ -z "$_HAS_KEY" ] && [ -n "${OLLAMA_API_KEY:-}" ] && _HAS_KEY=1
+
+if [ -n "$_HAS_KEY" ]; then
+    echo "         OLLAMA_API_KEY detected — running initial probe..."
+    "$VENV_PY" "$PROBE_SCRIPT" >> "$LOG_FILE" 2>&1 || true
+    echo "         Initial probe complete. See $LOG_FILE"
+else
+    echo "         OLLAMA_API_KEY not yet configured."
+    echo "         Set it in $SENTINEL_HOME/.env then run:  sentinel refresh"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 5: Generate uninstall script
+# ---------------------------------------------------------------------------
+_step "5/6" "Generating uninstall script..."
+
+UNINSTALL_SCRIPT="$PROJECT_DIR/uninstall"
+cat > "$UNINSTALL_SCRIPT" << UNINSTALL_EOF
+#!/usr/bin/env bash
+# uninstall — generated by Sentinel installer
+# Removes all Sentinel components from this system.
+set -euo pipefail
+
+_PROJECT_DIR="$PROJECT_DIR"
+_SENTINEL_HOME="$SENTINEL_HOME"
+_CRON_TAG="$CRON_TAG"
+_PATH_MARKER="$PROJECT_DIR"
+
+echo
+echo "  ============================================================="
+echo "   SENTINEL UNINSTALLER"
+echo "  ============================================================="
+echo
+echo "   This will:"
+echo "     - Remove the daily cron job"
+echo "     - Remove Sentinel from PATH (bashrc / zshrc)"
+echo "     - Delete all project files in \$_PROJECT_DIR"
+echo
+echo "   Your sessions and API keys in \$_SENTINEL_HOME are NOT deleted."
+echo "   Remove that folder manually for a complete clean wipe."
+echo
+read -r -p "   Type YES to confirm: " _CONF
+if [ "\${_CONF}" != "YES" ]; then
+    echo "   Uninstall cancelled."
+    exit 0
+fi
+
+echo
+echo "   Removing cron job..."
+( crontab -l 2>/dev/null | grep -v "\$_CRON_TAG" ) | crontab - 2>/dev/null || true
+echo "   Done."
+
+echo "   Removing from PATH (bashrc / zshrc)..."
+for _RC in "\$HOME/.bashrc" "\$HOME/.bash_profile" "\$HOME/.zshrc"; do
+    if [ -f "\$_RC" ]; then
+        # Remove any line containing the project dir path marker
+        grep -v "\$_PATH_MARKER" "\$_RC" > "\${_RC}.tmp" && mv "\${_RC}.tmp" "\$_RC" || true
+    fi
+done
+echo "   Done."
+
+echo "   Deleting project files..."
+# cd out of the project dir before deleting it
+cd "\$HOME"
+rm -rf "\$_PROJECT_DIR"
+echo "   Sentinel has been uninstalled. You may close this terminal."
+UNINSTALL_EOF
+
+chmod +x "$UNINSTALL_SCRIPT"
+echo "         Generated: $UNINSTALL_SCRIPT"
+
+# ---------------------------------------------------------------------------
+# Step 5b: Create .env template if absent
+# ---------------------------------------------------------------------------
+if [ ! -f "$SENTINEL_HOME/.env" ]; then
+    cat > "$SENTINEL_HOME/.env" << ENV_EOF
+# Sentinel environment variables
+# Generated by installer — fill in your keys here.
+
+# Required for online mode
+# OLLAMA_API_KEY=
+
+# Optional external provider fallbacks
+# ANTHROPIC_API_KEY=
+# OPENAI_API_KEY=
+# GOOGLE_API_KEY=
+
+# Uncomment to default to online mode on every launch
+# SENTINEL_MODE=online
+ENV_EOF
+    echo "         Created: $SENTINEL_HOME/.env  (add your API keys here)"
+fi
+
+# ---------------------------------------------------------------------------
+# Done
+# ---------------------------------------------------------------------------
+_step "6/6" "Installation complete!"
+echo
+echo "  ================================================================="
+_bold "   Sentinel is ready."
+echo
+echo "   Reload your shell or open a new terminal, then:"
+echo "     sentinel                 — start Sentinel"
+echo "     sentinel --online        — start in online mode"
+echo "     sentinel refresh         — refresh cloud model cache"
+echo
+echo "   Configure API keys:"
+echo "     $SENTINEL_HOME/.env"
+echo
+echo "   To uninstall:"
+echo "     $UNINSTALL_SCRIPT"
+echo "  ================================================================="
+echo
+
+# Self-delete
+echo "   Removing installer..."
+rm -- "$0"

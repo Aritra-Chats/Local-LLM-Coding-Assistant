@@ -6,6 +6,10 @@ prompt_toolkit>=3.0.43
 # Used by OllamaClient, EmbeddingClient, url_fetcher, project_synopsis
 requests>=2.31
 
+# ── Ollama Python SDK ────────────────────────────────────────────────────────
+# Required for cloud model discovery (scripts/cloud_model_probe.py)
+ollama>=0.3
+
 # ── Numerical / embeddings ────────────────────────────────────────────────────
 # Used by RAGEngine for cosine-similarity search over embedding vectors
 numpy>=1.26
@@ -34,3 +38,16 @@ requests>=2.31
 # Install: pip install llama-cpp-python   (or with CUDA: CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python)
 # Requires SENTINEL_USE_LLAMACPP=1 and SENTINEL_LLAMACPP_MODEL=/path/to/model.gguf
 # llama-cpp-python>=0.2.85
+
+# ── External provider SDKs (optional — required for online mode) ──────────────
+# Install any or all of these to enable cloud-provider fallback routing.
+# Online mode requires at minimum OLLAMA_API_KEY for Ollama Cloud (no SDK needed).
+
+# Anthropic Claude — pip install anthropic
+# anthropic>=0.28
+
+# OpenAI ChatGPT — pip install openai
+# openai>=1.30
+
+# Google Gemini — pip install google-generativeai
+# google-generativeai>=0.7

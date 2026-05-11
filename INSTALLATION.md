@@ -45,26 +45,24 @@ python --version
 git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
 cd Local-LLM-Coding-Assistant
 
-# 2. Virtual environment
-python -m venv .venv
+# 2. Add the Sentinel folder to your PATH
+#    Windows example: setx PATH "%PATH%;C:\tools\local-llm-assistant"
 
-# 3. Activate (see platform sections below)
+# 3. Open a new PowerShell window and launch Sentinel
+sentinel --project C:\work\my-project
 
-# 4. Install dependencies
-pip install -r requirements.txt
-
-# 5. Copy environment template
+# 4. Copy environment template (optional, only if you want to override defaults)
 cp .env.example .env           # Linux / macOS
 copy .env.example .env         # Windows
-
-# 6. Launch (runs bootstrap on first start)
-python main.py
 ```
 
 On first launch Sentinel will automatically:
 - Detect your hardware and select a hardware mode
-- Install any missing Python packages
-- Pull the required Ollama models
+- Create a local Python virtual environment under the Sentinel folder
+- Install any missing Python packages into that venv
+- Install Ollama with winget if it is missing
+- Prompt you to choose ONLINE or OFFLINE mode with arrow-key navigation
+- Pull only the Ollama models required for the chosen startup mode
 - Create `~/.sentinel/` workspace directories
 
 ---
@@ -76,20 +74,13 @@ On first launch Sentinel will automatically:
 git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
 cd Local-LLM-Coding-Assistant
 
-# Create and activate venv
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-
-# If execution policy blocks activation:
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-
-# Install dependencies
-pip install -r requirements.txt
+# Add the folder to PATH, then open a new PowerShell window
 
 # Launch
+sentinel --project C:\work\my-project
+
+# Fallback if you want to run the repo directly from its folder
 python main.py
-# or use the launcher:
-sentinel.bat
 ```
 
 ---
@@ -100,16 +91,54 @@ sentinel.bat
 git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
 cd Local-LLM-Coding-Assistant
 
-python3.11 -m venv .venv
-source .venv/bin/activate
+sentinel
+```
 
-pip install -r requirements.txt
-python main.py
+Make the `sentinel` script executable and add it to your PATH (one-time):
+
+```bash
+chmod +x sentinel
+# Option A: symlink into a PATH directory (recommended)
+sudo ln -s "$(pwd)/sentinel" /usr/local/bin/sentinel
+
+# Option B: add the repository folder to your PATH in your shell profile:
+# echo 'export PATH="$PATH:$(pwd)"' >> ~/.bashrc && source ~/.bashrc
 ```
 
 ---
 
-## 5. Ollama Setup
+## 5. Use Sentinel From Another Project Repo
+
+If your goal is to work on a separate project repository, keep Sentinel installed in its own folder and point it at the project you want to edit.
+
+### One-time setup
+
+```powershell
+# 1. Download or clone Sentinel somewhere stable, for example:
+cd C:\tools\local-llm-assistant
+
+# 2. Add that folder to PATH, then open a new PowerShell window
+
+# 3. Verify the command is available
+Get-Command sentinel
+```
+
+### Start Sentinel against your project repo
+
+```powershell
+# Option A: pass the project repo each time
+sentinel --project C:\work\my-project
+
+# Option B: make one project the default for this shell session
+$env:SENTINEL_PROJECT_DIR = "C:\work\my-project"
+sentinel
+```
+
+If you want the command available in future PowerShell windows, keep the Sentinel folder on PATH. The batch file is what makes PATH-based launching work.
+
+---
+
+## 6. Ollama Setup
 
 Sentinel requires [Ollama](https://ollama.ai) running locally.
 
@@ -165,16 +194,18 @@ ollama pull nomic-embed-text
 
 ---
 
-## 6. Model Selection
+## 7. Model Selection
 
 Sentinel auto-selects models based on your hardware. You can override:
+
+On first launch, the operating-mode prompt uses keyboard navigation instead of numeric input.
 
 ### Override for the current session
 
 ```bash
-python main.py --mode minimal     # force minimal models
-python main.py --mode standard    # force standard models
-python main.py --mode advanced    # force advanced models
+sentinel --hw-mode minimal        # force minimal models
+sentinel --hw-mode standard       # force standard models
+sentinel --hw-mode advanced       # force advanced models
 ```
 
 ### Make mode override your default
@@ -183,7 +214,7 @@ There is currently no dedicated environment variable for hardware mode.
 Use a shell alias or launcher script to always start with your preferred mode:
 
 ```bash
-python main.py --mode standard
+sentinel --hw-mode standard
 ```
 
 ### Alternative models
@@ -196,9 +227,35 @@ Any Ollama-compatible model works. Well-tested alternatives:
 | Reasoning | `llama3:8b`, `phi3:medium`, `gemma2:9b` |
 | Large context | `llama3:70b` (requires ≥ 40 GB RAM or large GPU) |
 
+### Online mode and cloud model discovery
+
+When using `--online`, Sentinel can discover and use models from cloud providers:
+
+```bash
+sentinel --online --hw-mode standard
+```
+
+In this mode, Sentinel uses the `online_model_discovery` subsystem to:
+- Query available cloud models (OpenAI, Anthropic, local providers)
+- Automatically select the best model for each task
+- Fall back to local models if cloud APIs are unavailable
+
+The online mode is useful when:
+- You have API credentials configured
+- You want higher-quality reasoning for complex tasks
+- Your local hardware is limited
+
+To check available cloud models:
+
+```
+sentinel › /models
+```
+
+This lists both local Ollama models and discovered cloud models (if in online mode).
+
 ---
 
-## 7. Environment Variables
+## 8. Environment Variables
 
 Copy `.env.example` to `.env` and adjust as needed:
 
@@ -223,7 +280,7 @@ SENTINEL_PROJECT_DIR=C:\code\my-project
 
 ---
 
-## 8. Offline Installation
+## 9. Offline Installation
 
 For air-gapped environments:
 
@@ -255,12 +312,12 @@ pip install --no-index --find-links=./packages -r requirements.txt
 ### Step 3 — Skip bootstrap network checks
 
 ```bash
-python main.py --no-bootstrap
+sentinel --no-bootstrap
 ```
 
 ---
 
-## 9. GPU Setup
+## 10. GPU Setup
 
 ### NVIDIA (CUDA)
 
@@ -281,7 +338,7 @@ Ollama uses Metal automatically on Apple Silicon Macs. Sentinel will detect `has
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### `ollama: command not found`
 
@@ -336,7 +393,7 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 Force a specific mode:
 
 ```bash
-python main.py --mode minimal
+sentinel --hw-mode minimal
 ```
 
 ### Session data location

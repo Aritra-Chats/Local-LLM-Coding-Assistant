@@ -10,6 +10,25 @@ class BaseAgent(ABC):
     and implement all abstract methods.
     """
 
+    def __init__(self) -> None:
+        # Inference client injected at runtime by ConcreteExecutionEngine.
+        # Agents that use an LLM directly should check self._inference_client
+        # before falling back to their default local client.
+        self._inference_client: Optional[Any] = None
+
+    def use_client(self, client: Any) -> None:
+        """Inject an inference client for this agent to use.
+
+        Called by :class:`~core.execution_engine.ConcreteExecutionEngine`
+        in online mode so agents transparently route to the selected
+        provider (local Ollama, Ollama Cloud, Anthropic, OpenAI, Google).
+
+        Args:
+            client: An inference client that exposes at minimum a
+                    ``generate(model, prompt, **kwargs)`` method.
+        """
+        self._inference_client = client
+
     @abstractmethod
     def run(self, task: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """Execute the agent's primary responsibility for a given task.

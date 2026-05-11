@@ -313,6 +313,32 @@ class Pipeline:
         """Look up a step by its ``step_id``."""
         return next((s for s in self.steps if s.step_id == step_id), None)
 
+    def validate_dependencies(self) -> None:
+        """Validate that every ``depends_on`` step_id exists in this pipeline.
+
+        Called automatically at pipeline construction time by
+        :meth:`~execution.pipeline.DynamicPipelineGenerator._build`.
+        Use this method on any manually-constructed :class:`Pipeline` before
+        handing it to the execution engine.
+
+        Raises:
+            ValueError: Listing all unresolved dependency IDs found.
+        """
+        known_ids = {s.step_id for s in self.steps}
+        missing: List[str] = []
+        for step in self.steps:
+            for dep_id in step.depends_on:
+                if dep_id not in known_ids:
+                    missing.append(
+                        f"step '{step.name}' (id={step.step_id}) "
+                        f"depends_on unknown step_id '{dep_id}'"
+                    )
+        if missing:
+            raise ValueError(
+                "Pipeline dependency validation failed — unresolved IDs:\n"
+                + "\n".join(f"  • {m}" for m in missing)
+            )
+
     # ------------------------------------------------------------------
     # Serialisation
     # ------------------------------------------------------------------
@@ -900,7 +926,7 @@ class DynamicPipelineGenerator:
                     seen.add(h)
                     ctx_hints.append(h)
 
-        return Pipeline(
+        pipeline = Pipeline(
             pipeline_id=str(uuid.uuid4()),
             task_id=task_id,
             goal=goal,
@@ -914,6 +940,11 @@ class DynamicPipelineGenerator:
             classification=classification,
             plan_id=plan_id,
         )
+        # BUG-3 fix: validate dependency references at construction time so
+        # that a missing dep_id raises immediately rather than causing an
+        # infinite loop in the execution engine's while-remaining loop.
+        pipeline.validate_dependencies()
+        return pipeline
 
     @staticmethod
     def _dict_to_pipeline_step(d: Dict[str, Any]) -> "PipelineStep":

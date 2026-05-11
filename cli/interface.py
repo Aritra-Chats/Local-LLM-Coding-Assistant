@@ -5,6 +5,7 @@ input prompt. Registers all supported slash commands and delegates
 task input to the agent pipeline.
 """
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from prompt_toolkit import PromptSession
@@ -200,9 +201,20 @@ class InteractiveUI:
             ),
             Command(
                 name="mode",
-                description="Show or switch the hardware mode (minimal/standard/advanced).",
-                usage="/mode [minimal|standard|advanced]",
+                description="Show or switch the hardware mode (minimal/standard/advanced) or online/offline mode.",
+                usage="/mode [minimal|standard|advanced|online|offline]",
                 handler=self._cmd_mode,
+            ),
+            Command(
+                name="files",
+                description="Show all files created or modified during the current session.",
+                handler=self._cmd_files,
+            ),
+            Command(
+                name="refresh",
+                description="Refresh the Ollama Cloud model cache (online mode). Re-probes which models are accessible on your plan.",
+                usage="/refresh",
+                handler=self._cmd_refresh,
             ),
         ]
         self.parser.register_many(commands)
@@ -380,24 +392,105 @@ class InteractiveUI:
         )
 
     def _cmd_mode(self, parsed: ParsedInput) -> None:
-        valid = ("minimal", "standard", "advanced")
+        hw_valid = ("minimal", "standard", "advanced")
+        io_valid = ("online", "offline")
+        all_valid = hw_valid + io_valid
         if not parsed.args:
-            current = self.session.metadata.get("hardware_mode", "[unknown]")
+            current_hw = self.session.metadata.get("hardware_mode", "[unknown]")
+            import os
+            current_io = os.environ.get("SENTINEL_MODE", "offline")
             console.print(
-                f"  Current mode: [bold cyan]{current}[/bold cyan]\n"
-                f"  To switch: /mode <{'|'.join(valid)}>\n"
-                "  Note: mode change takes effect on next restart (--mode flag)."
+                f"  Hardware mode : [bold cyan]{current_hw}[/bold cyan]\n"
+                f"  Network mode  : [bold cyan]{current_io}[/bold cyan]\n"
+                f"  To switch hw  : /mode <{'|'.join(hw_valid)}>\n"
+                f"  To switch net : /mode <{'|'.join(io_valid)}>\n"
+                "  Note: hardware mode change takes effect on next restart (--hw-mode flag)."
             )
             return
         mode = parsed.args[0].lower()
-        if mode not in valid:
-            console.print(f"[red]Unknown mode '{mode}'. Choose: {', '.join(valid)}[/red]")
+        if mode not in all_valid:
+            console.print(f"[red]Unknown mode '{mode}'. Choose: {', '.join(all_valid)}[/red]")
             return
-        self.session.metadata["hardware_mode"] = mode
-        console.print(
-            f"[yellow]Mode set to [bold]{mode}[/bold] in session metadata.\n"
-            "Restart Sentinel with [bold]--mode " + mode + "[/bold] to apply."
-        )
+        if mode in hw_valid:
+            self.session.metadata["hardware_mode"] = mode
+            console.print(
+                f"[yellow]Hardware mode set to [bold]{mode}[/bold] in session metadata.\n"
+                "Restart Sentinel with [bold]--hw-mode " + mode + "[/bold] to apply."
+            )
+        else:
+            import os
+            os.environ["SENTINEL_MODE"] = mode
+            self.session.metadata["sentinel_mode"] = mode
+            console.print(
+                f"[green]✔[/green] Network mode switched to [bold]{mode.upper()}[/bold] for this session."
+            )
+
+    def _cmd_files(self, parsed: ParsedInput) -> None:
+        """Show all files changed during the active pipeline runs."""
+        from datetime import datetime
+        runtime = getattr(self, "_runtime", None)
+        engine = getattr(runtime, "_engine", None) if runtime else None
+        fcm = getattr(engine, "file_change_map", None) if engine else None
+
+        if fcm is None:
+            console.print("[dim]No file change map available for this session.[/dim]")
+            return
+
+        events = fcm.all_events()
+        if not events:
+            console.print("[dim]No files have been changed in this session yet.[/dim]")
+            return
+
+        from rich.table import Table as _Table
+        table = _Table(title="File Changes — Current Session", border_style="cyan")
+        table.add_column("Operation", style="bold", no_wrap=True)
+        table.add_column("Logical Path")
+        table.add_column("Absolute Path")
+        table.add_column("Step")
+        table.add_column("Agent")
+        table.add_column("Time")
+
+        op_colours = {"create": "green", "modify": "yellow", "delete": "red"}
+        for ev in events:
+            colour = op_colours.get(ev.operation, "white")
+            ts = datetime.fromtimestamp(ev.timestamp_ms / 1000).strftime("%H:%M:%S")
+            table.add_row(
+                f"[{colour}]{ev.operation}[/{colour}]",
+                ev.logical_path,
+                ev.absolute_path,
+                ev.step_id[:8] if ev.step_id else "-",
+                ev.agent or "-",
+                ts,
+            )
+        console.print(table)
+
+    def _cmd_refresh(self, parsed: ParsedInput) -> None:
+        """Re-probe Ollama Cloud and rebuild the accessible-model cache."""
+        import os as _os
+        mode = _os.environ.get("SENTINEL_MODE", "offline")
+        if mode != "online":
+            console.print(
+                "[yellow]! /refresh is only useful in online mode. "
+                "Switch with [bold]/mode online[/bold] first.[/yellow]"
+            )
+            return
+
+        console.print("[cyan]Refreshing Ollama Cloud model cache…[/cyan]")
+        try:
+            import importlib.util
+            _probe = Path(__file__).parent.parent / "scripts" / "cloud_model_probe.py"
+            spec   = importlib.util.spec_from_file_location("cloud_model_probe", _probe)
+            mod    = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)                    # type: ignore[union-attr]
+            ok = mod.run_probe(force=True, verbose=True)
+            if ok:
+                console.print("[bold green]✓ Cloud model cache refreshed.[/bold green]")
+            else:
+                console.print(
+                    "[red]✗ Refresh failed — check OLLAMA_API_KEY and connectivity.[/red]"
+                )
+        except Exception as _exc:
+            console.print(f"[red]Refresh error: {_exc}[/red]")
 
     def _cmd_clear(self, parsed: ParsedInput) -> None:
         console.clear()

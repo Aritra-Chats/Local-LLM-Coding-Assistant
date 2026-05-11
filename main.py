@@ -32,6 +32,133 @@ console = Console()
 
 _ENTRY_DIR = Path(__file__).resolve().parent
 
+# ---------------------------------------------------------------------------
+# BUG-1 fix helper: domain-aware sub_task → step matching
+# ---------------------------------------------------------------------------
+
+# Maps routing_domain / domain values → canonical agent names used in steps.
+_DOMAIN_TO_AGENT: Dict[str, str] = {
+    "coding_frontend":  "coding",
+    "coding_backend":   "coding",
+    "coding_general":   "coding",
+    "data_science":     "coding",
+    "debugging":        "debugging",
+    "research":         "research",
+    "devops":           "devops",
+    "security":         "debugging",
+    "system":           "system",
+    "math":             "reasoning",
+    "creative":         "coding",
+    "other":            "coding",
+    "root":             "coding",
+}
+
+
+def _pick_best_supervisor_cloud_model(cloud_models: list) -> str:
+    """Return the best cloud model tag for use as the supervisor/decomposition model.
+
+    Strategy (all runtime, no hardcoded names):
+      1. Parse the parameter count from the model tag or its ``details`` dict.
+         Scans the full tag string for NNb / NNxNNb patterns so tags like
+         ``gemma4:31b-cloud`` and ``qwen3.5:32b`` are handled correctly.
+      2. Prefer the *largest* model available — task decomposition is a
+         structured reasoning task that benefits from higher capacity.
+      3. Fall back to the first model in the list if sizes cannot be parsed.
+
+    Args:
+        cloud_models: List of model dicts returned by OllamaCloudClient.list_models().
+                      Dicts may use ``"name"`` (api/tags format) or ``"id"``
+                      (/v1/models OpenAI format) — both are handled.
+
+    Returns:
+        The base model tag (no ``:cloud`` suffix) of the selected model,
+        or an empty string if the list is empty.
+    """
+    import re as _re
+
+    def _param_billions(m: dict) -> float:
+        # Support both /api/tags ("name") and /v1/models ("id") key names
+        tag = m.get("name") or m.get("id") or m.get("model", "")
+
+        # 1. Try structured details field first (most accurate)
+        details  = m.get("details", {}) or {}
+        size_str = details.get("parameter_size") or details.get("parameters") or ""
+
+        # 2. Scan the full tag string for size patterns when details unavailable.
+        #    Strip :cloud suffix then search the whole string so tags like
+        #    "gemma4:31b-cloud", "qwen3.5:32b", "codellama:34b" all parse.
+        if not size_str:
+            clean = tag.replace(":cloud", "").replace("-cloud", "").upper()
+            # MoE pattern first: e.g. 8x7b
+            moe = _re.search(r"(\d+)X(\d+(?:\.\d+)?)B", clean)
+            if moe:
+                return float(moe.group(1)) * float(moe.group(2))
+            # Plain pattern: e.g. 31b, 0.5b, 675b
+            plain = _re.search(r"(\d+(?:\.\d+)?)B", clean)
+            if plain:
+                return float(plain.group(1))
+            return 0.0
+
+        s   = str(size_str).strip().upper()
+        moe = _re.match(r"(\d+)X(\d+(?:\.\d+)?)B", s)
+        if moe:
+            return float(moe.group(1)) * float(moe.group(2))
+        plain = _re.match(r"(\d+(?:\.\d+)?)B", s)
+        if plain:
+            return float(plain.group(1))
+        return 0.0
+
+    if not cloud_models:
+        return ""
+    ranked = sorted(cloud_models, key=_param_billions, reverse=True)
+    best   = ranked[0]
+    tag    = best.get("name") or best.get("id") or best.get("model", "")
+    # Strip :cloud and -cloud suffixes — the direct API uses bare tags
+    return _re.sub(r"[:-]cloud$", "", tag) if tag else ""
+
+def _match_subtask_for_step(
+    step: Any,
+    sub_tasks: List[Dict],
+    used_indices: Set[int],
+) -> Optional[Dict]:
+    """Return the best-matching sub_task for *step*, avoiding re-use.
+
+    Matching priority:
+    1. A not-yet-used sub_task whose ``routing_domain`` or ``domain``
+       maps to the step's ``agent``.
+    2. The first not-yet-used sub_task (positional fallback).
+    3. The last sub_task in the list (ultimate fallback — mirrors original
+       behaviour without silent clipping).
+
+    Args:
+        step:        A :class:`~execution.pipeline.PipelineStep`.
+        sub_tasks:   Flat list of sub_task dicts from TaskSegregator.
+        used_indices: Set of indices already consumed; mutated in-place
+                      when a match is found.
+
+    Returns:
+        The matched sub_task dict, or ``None`` when *sub_tasks* is empty.
+    """
+    if not sub_tasks:
+        return None
+    step_agent = getattr(step, "agent", "")
+    # ── Pass 1: domain-matched, not yet consumed ──────────────────────
+    for idx, st in enumerate(sub_tasks):
+        if idx in used_indices:
+            continue
+        domain = st.get("routing_domain") or st.get("domain", "")
+        mapped_agent = _DOMAIN_TO_AGENT.get(domain, domain)
+        if mapped_agent == step_agent or domain == step_agent:
+            used_indices.add(idx)
+            return st
+    # ── Pass 2: first unconsumed ──────────────────────────────────────
+    for idx, st in enumerate(sub_tasks):
+        if idx not in used_indices:
+            used_indices.add(idx)
+            return st
+    # ── Pass 3: last entry (never re-added to used_indices) ───────────
+    return sub_tasks[-1]
+
 
 # ── Deferred imports ─────────────────────────────────────────────────────
 def _import_modules() -> Dict[str, Any]:
@@ -69,9 +196,12 @@ def _import_modules() -> Dict[str, Any]:
 
 class SentinelRuntime:
     def __init__(self, project_root: str = "", force_mode: Optional[str] = None,
+                 force_io_mode: Optional[str] = None,
                  skip_bootstrap: bool = False) -> None:
         self.project_root    = Path(project_root or os.getcwd()).resolve()
-        self._force_mode     = force_mode
+        self._force_mode     = force_mode      # hardware profile (minimal/standard/advanced)
+        self._force_io_mode  = force_io_mode   # "online" | "offline" | None (prompt)
+        self._mode: str      = "offline"       # resolved after connectivity check
         self._skip_bootstrap = skip_bootstrap
         self.profile = self._supervisor = self._engine = None
         self._exploration_report = None
@@ -79,9 +209,71 @@ class SentinelRuntime:
         self._context_builder = self._task_planner = self._pipeline_gen = None
         self._model_router = self._perf_tracker = self._pipeline_opt = None
         self._mods: Dict[str, Any] = {}
+        self._tree_engine: Any = None  # Part 4: ConcreteTreeExecutionEngine
 
     def initialise(self, session_id: str = "") -> None:
         self._mods = _import_modules()
+
+        # ── Step 0: Connectivity check + mode selection ──────────────────
+        from core.connectivity import ConnectivityChecker
+
+        internet_available = ConnectivityChecker.check()
+
+        if not internet_available:
+            console.print(Panel(
+                "[yellow]⚠  No internet connection detected.[/yellow]\n"
+                "Sentinel will run in [bold]OFFLINE[/bold] mode.\n"
+                "All inference will use your local Ollama models.",
+                title="[bold red]Connectivity[/bold red]",
+                border_style="red",
+            ))
+            resolved_mode = "offline"
+
+        elif self._force_io_mode is not None:
+            resolved_mode = self._force_io_mode
+            console.print(
+                f"[dim]Mode forced via CLI flag:[/dim] [bold]{resolved_mode.upper()}[/bold]"
+            )
+
+        else:
+            console.print(Panel(
+                "[green]●  Internet connection detected.[/green]\n\n"
+                "Use the arrow keys to choose a launch mode, then press Enter.\n\n"
+                "  [bold cyan]ONLINE mode[/bold cyan]  — Tasks are routed to the best\n"
+                "       available cloud model (Ollama Cloud, Claude, Gemini, ChatGPT).\n"
+                "       Requires API keys for external providers.\n\n"
+                "  [bold white]OFFLINE mode[/bold white] — All inference runs locally via\n"
+                "       your Ollama installation. No API keys needed.",
+                title="[bold green]Select Operating Mode[/bold green]",
+                border_style="green",
+            ))
+            from cli.selection_menu import select_option
+
+            resolved_mode = select_option(
+                title="Select Operating Mode",
+                prompt="Use the arrow keys to move, Enter to confirm, and Esc to keep the default.",
+                options=[
+                    ("online", "ONLINE mode"),
+                    ("offline", "OFFLINE mode"),
+                ],
+                default_index=1,
+            )
+
+        os.environ["SENTINEL_MODE"] = resolved_mode
+        self._mode = resolved_mode
+        console.print(f"  [green]✔[/green] Mode set to [bold]{resolved_mode.upper()}[/bold]")
+
+        # ── API key collection (online mode only) ────────────────────────
+        if self._mode == "online":
+            from core.api_key_manager import APIKeyManager
+            from config.settings import SENTINEL_HOME
+            mgr = APIKeyManager(env_file=SENTINEL_HOME / ".env")
+            safe_to_proceed = mgr.check_and_collect()
+            if not safe_to_proceed:
+                self._mode = "offline"
+                os.environ["SENTINEL_MODE"] = "offline"
+                console.print("[yellow]Continuing in OFFLINE mode.[/yellow]")
+
         console.print("[dim]Step 1/6 — Loading hardware profile…[/dim]")
         self.profile = self._bootstrap()
 
@@ -127,6 +319,15 @@ class SentinelRuntime:
             require_approval=True,
             context_builder=self._context_builder,
         )
+
+        # Part 4: Construct TreeExecutionEngine once, reusing existing components.
+        from core.tree_execution_engine import ConcreteTreeExecutionEngine
+        self._tree_engine = ConcreteTreeExecutionEngine(
+            concrete_engine=self._engine,
+            task_planner=self._task_planner,
+            pipeline_generator=self._pipeline_gen,
+            tool_registry=self._tool_registry,
+        )
         console.print("[bold green]✔ Sentinel runtime initialised.[/bold green]")
 
     def _bootstrap(self):
@@ -136,7 +337,7 @@ class SentinelRuntime:
                 from system.hardware_detector import SystemCheck
                 from config.hardware_profile import HardwareProfiler
                 return HardwareProfiler().classify(SystemCheck().run())
-            return Bootstrap().run()
+            return Bootstrap().run(launch_mode=self._mode)
         except Exception as exc:
             console.print(f"  [yellow]⚠[/yellow] Bootstrap error ({exc}); using standard defaults.")
             from config.hardware_profile import HardwareMode, HardwareProfile
@@ -158,6 +359,45 @@ class SentinelRuntime:
         # operates with accurate architectural knowledge.
         self._run_repo_exploration()
 
+        # ── Phase 0.5: Resolve supervisor client for online mode ───────────
+        # In online mode we want parse_prompt() to run on the best available
+        # cloud reasoning model, not the local one.  We resolve this BEFORE
+        # calling parse_prompt so the supervisor already has the right client
+        # injected when it does its LLM call.  Falls back to local silently.
+        import os as _os_sup
+        if _os_sup.environ.get("SENTINEL_MODE", "offline") == "online":
+            try:
+                _sup_local_client = None
+                _coding_agent = self._agent_registry.get("coding")
+                if _coding_agent is not None:
+                    _sup_local_client = getattr(_coding_agent, "_ollama", None)
+
+                _sup_cloud_client = None
+                _sup_cloud_model  = None
+                try:
+                    from models.ollama_cloud_client import OllamaCloudClient as _OCC_sup
+                    _cloud_sup   = _OCC_sup()
+                    _cloud_mdls  = _cloud_sup.list_models()
+                    if _cloud_mdls:
+                        _best_sup = _pick_best_supervisor_cloud_model(_cloud_mdls)
+                        if _best_sup:
+                            _sup_cloud_client = _cloud_sup
+                            _sup_cloud_model  = _best_sup
+                except Exception:
+                    pass  # cloud unavailable — stay on local
+
+                if _sup_cloud_client and _sup_cloud_model:
+                    # Inject cloud client + model into the registered supervisor so
+                    # parse_prompt() and run() both use it for this request.
+                    self._supervisor.use_client(_sup_cloud_client)
+                    self._supervisor._model = _sup_cloud_model
+                    console.print(
+                        f"  [cyan]→[/cyan] Supervisor using cloud model "
+                        f"[bold]{_sup_cloud_model}[/bold]"
+                    )
+            except Exception:
+                pass  # never fail the whole pipeline for supervisor upgrade
+
         task = self._supervisor.parse_prompt(prompt)
         task.update({"session_id": session_id, "project_root": str(self.project_root)})
         console.print(
@@ -171,19 +411,206 @@ class SentinelRuntime:
             supervisor_ctx["stack"]       = self._exploration_report.stack
         self._supervisor.run(task, supervisor_ctx)
 
+        # ── Online mode: task segregation + model discovery ───────────────
+        import os
+        if os.environ.get("SENTINEL_MODE", "offline") == "online":
+            try:
+                from core.task_segregator import TaskSegregator
+                from core.online_model_discovery import OnlineModelDiscoveryEngine
+
+                # ── Supervisor client / model for online mode ─────────────
+                # Re-use the same cloud client already resolved above (if any).
+                # Falls back to the local reasoning model if cloud is unavailable.
+                ollama_client = None
+                coding_agent = self._agent_registry.get("coding")
+                if coding_agent is not None:
+                    ollama_client = getattr(coding_agent, "_ollama", None)
+
+                sup_client = ollama_client  # default: local
+                sup_model  = (
+                    self._model_router.select_reasoning_model()
+                    if self._model_router else "mistral:7b"
+                )
+
+                try:
+                    from models.ollama_cloud_client import OllamaCloudClient
+                    cloud_sup = OllamaCloudClient()
+                    cloud_models = cloud_sup.list_models()
+                    if cloud_models:
+                        # Pick the best reasoning model available on the cloud:
+                        # prefer the largest model (most capable for structured
+                        # JSON decomposition) that the API currently serves.
+                        best_cloud_model = _pick_best_supervisor_cloud_model(cloud_models)
+                        if best_cloud_model:
+                            sup_client = cloud_sup
+                            sup_model  = best_cloud_model
+                            console.print(
+                                f"  [cyan]→[/cyan] Supervisor: cloud model "
+                                f"[bold]{sup_model}[/bold]"
+                            )
+                except Exception as _sup_exc:
+                    console.print(
+                        f"  [dim]Cloud supervisor unavailable ({_sup_exc}); "
+                        "using local reasoning model.[/dim]"
+                    )
+
+                segregator = TaskSegregator(
+                    ollama_client=sup_client,
+                    supervisor_model=sup_model,
+                )
+                sub_tasks = segregator.segregate(prompt)
+                for st in sub_tasks:
+                    segregator.refine(st)
+                    segregator.classify(st)
+
+                # Model discovery
+                try:
+                    from models.ollama_cloud_client import OllamaCloudClient
+                    cloud_client = OllamaCloudClient()
+                except Exception:
+                    cloud_client = None
+
+                discovery = OnlineModelDiscoveryEngine(
+                    ollama_cloud_client=cloud_client,
+                    local_router=self._model_router,
+                    tool_registry=self._tool_registry,
+                )
+                for st in sub_tasks:
+                    discovery.discover(st)
+
+                # Print segregation summary
+                from rich.table import Table as _Table
+                sum_table = _Table(title="Task Segregation", border_style="green")
+                sum_table.add_column("#")
+                sum_table.add_column("Domain")
+                sum_table.add_column("Complexity")
+                sum_table.add_column("Provider : Model")
+                for i, st in enumerate(sub_tasks, 1):
+                    sel = st.get("selected_model", {})
+                    provider_model = f"{sel.get('provider', '?')} : {sel.get('model', '?')}"
+                    sum_table.add_row(
+                        str(i),
+                        st.get("routing_domain", st.get("domain", "?")),
+                        st.get("complexity", "?"),
+                        provider_model,
+                    )
+                console.print(sum_table)
+
+                # Stamp selected_model onto the task for downstream pipeline steps
+                if sub_tasks:
+                    task["sub_tasks"] = sub_tasks
+                    task["selected_model"] = sub_tasks[0].get("selected_model")
+            except Exception as exc:
+                console.print(f"  [yellow]⚠[/yellow] Online segregation failed ({exc}); using offline path.")
+
+        # ── Part 4: Tree execution path for non-trivial tasks ────────────────
+        # When complexity is not "low" (and the tree engine is available), we
+        # recursively decompose the prompt and execute via TreeExecutionEngine.
+        # The existing flat-pipeline path runs unchanged for low-complexity
+        # tasks or when SENTINEL_MODE=="offline".
+        import os as _os
+        _mode_is_online = _os.environ.get("SENTINEL_MODE", "offline") == "online"
+        _complexity = task.get("complexity", "medium")
+        if (
+            _complexity != "low"
+            and self._tree_engine is not None
+            and _mode_is_online
+        ):
+            try:
+                from core.task_segregator import TaskSegregator as _TS
+                from core.online_model_discovery import OnlineModelDiscoveryEngine as _OMD
+
+                _ollama_client = None
+                _coding_agent = self._agent_registry.get("coding")
+                if _coding_agent is not None:
+                    _ollama_client = getattr(_coding_agent, "_ollama", None)
+
+                # Reuse cloud supervisor if available (same logic as segregation above)
+                _sup_client = _ollama_client
+                _sup_model  = (
+                    self._model_router.select_reasoning_model()
+                    if self._model_router else "mistral:7b"
+                )
+                try:
+                    from models.ollama_cloud_client import OllamaCloudClient as _OCC
+                    _cloud_sup  = _OCC()
+                    _cloud_mdls = _cloud_sup.list_models()
+                    if _cloud_mdls:
+                        _best = _pick_best_supervisor_cloud_model(_cloud_mdls)
+                        if _best:
+                            _sup_client = _cloud_sup
+                            _sup_model  = _best
+                except Exception:
+                    pass
+
+                _segregator = _TS(
+                    ollama_client=_sup_client,
+                    supervisor_model=_sup_model,
+                )
+
+                console.print("  [cyan]→[/cyan] Building task decomposition tree…")
+                _tree = _segregator.build_tree(task.get("goal", ""), max_depth=4)
+
+                # Display tree structure in CLI before execution
+                try:
+                    from cli.progress_tracker import ProgressTracker as _PT
+                    _pt = _PT()
+                    _pt.display_tree(_tree)
+                    self._tree_engine._tracker = _pt
+                except Exception:
+                    pass
+
+                _session_ctx = {
+                    "session_id":   task.get("session_id", ""),
+                    "project_root": task.get("project_root", str(self.project_root)),
+                }
+                _tree_result = self._tree_engine.execute_tree(_tree, _session_ctx)
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                return {
+                    "status":      _tree_result.status,
+                    "summary":     _tree_result.summary(),
+                    "result":      _tree_result,
+                    "tree":        _tree,
+                    "elapsed_ms":  round(elapsed_ms, 2),
+                    "exploration": (
+                        self._exploration_report.to_dict()
+                        if self._exploration_report else None
+                    ),
+                }
+            except Exception as _exc:
+                console.print(
+                    f"  [yellow]⚠[/yellow] Tree execution failed ({_exc}); "
+                    "falling back to flat pipeline."
+                )
+
         plan     = self._task_planner.plan(task)
         pipeline = self._pipeline_gen.from_execution_plan(plan)
 
         # Stamp project_root, raw_prompt, and exploration onto every step.
         project_root_str = str(self.project_root)
         raw_prompt = task.get("raw_prompt", "")
-        for step in pipeline.steps:
+        sub_tasks = task.get("sub_tasks", [])
+        # BUG-1 fix: map sub_tasks → steps by domain/agent affinity instead
+        # of relying on positional index, which silently clips when counts
+        # differ.  A consumed-set prevents the same sub_task from being
+        # stamped onto two steps.
+        _used_st_indices: set = set()
+        for i, step in enumerate(pipeline.steps):
             step.metadata["project_root"] = project_root_str
             step.metadata["raw_prompt"]   = raw_prompt
             if self._exploration_report is not None:
                 step.metadata["synopsis"]      = self._exploration_report.synopsis
                 step.metadata["stack"]         = self._exploration_report.stack
                 step.metadata["entry_points"]  = self._exploration_report.entry_points
+            # Online mode: stamp per-step selected_model from sub_task decomposition
+            if sub_tasks:
+                st = _match_subtask_for_step(step, sub_tasks, _used_st_indices)
+                if st and "selected_model" in st:
+                    step.metadata["selected_model"] = st["selected_model"]
+                    try:
+                        step.selected_model = st["selected_model"]
+                    except AttributeError:
+                        pass
 
         if self._pipeline_opt:
             try:
@@ -209,20 +636,41 @@ class SentinelRuntime:
         Re-uses the explorer's hash-based on-disk cache so repeated calls
         within the same session are instant.  Never raises -- errors are
         printed as a warning and exploration is simply skipped.
+
+        In online mode the synopsis model is upgraded to the best available
+        cloud reasoning model so architectural summaries are higher quality.
         """
         try:
             from context.repo_explorer import RepoExplorer
+            import os as _os
+
             ollama_client = None
             coding_agent = self._agent_registry.get("coding")
             if coding_agent is not None:
                 ollama_client = getattr(coding_agent, "_ollama", None)
-            synopsis_model = (
+
+            synopsis_client = ollama_client
+            synopsis_model  = (
                 self._model_router.select_reasoning_model()
                 if self._model_router else "mistral:7b"
             )
+
+            # In online mode, use the best cloud model for richer repo synopsis
+            if _os.environ.get("SENTINEL_MODE", "offline") == "online":
+                try:
+                    from models.ollama_cloud_client import OllamaCloudClient
+                    _cloud = OllamaCloudClient()
+                    _mdls  = _cloud.list_models()
+                    if _mdls:
+                        _best = _pick_best_supervisor_cloud_model(_mdls)
+                        if _best:
+                            synopsis_client = _cloud
+                            synopsis_model  = _best
+                except Exception:
+                    pass  # fall through to local model
             explorer = RepoExplorer(
                 project_root=str(self.project_root),
-                ollama_client=ollama_client,
+                ollama_client=synopsis_client,
                 synopsis_model=synopsis_model,
                 use_cache=True,
             )
@@ -1153,15 +1601,52 @@ def main() -> None:
     )
     parser.add_argument("--resume",   metavar="SESSION_ID", default=None)
     parser.add_argument("--project",  metavar="PATH",        default=None)
+    # Hardware profile selection (renamed from --mode to free it for online/offline)
+    parser.add_argument("--hw-mode",  dest="hw_mode",
+                        choices=["minimal", "standard", "advanced"], default=None)
+    # Keep --mode for backward compatibility (maps to hw_mode)
     parser.add_argument("--mode",     choices=["minimal", "standard", "advanced"], default=None)
+    # Explicit online / offline flags (skip the interactive connectivity prompt)
+    parser.add_argument("--online",   action="store_true",
+                        help="Force online mode (skips connectivity prompt).")
+    parser.add_argument("--offline",  action="store_true",
+                        help="Force offline mode (skips connectivity prompt).")
     parser.add_argument("--no-bootstrap", action="store_true")
+    # --refresh: re-probe Ollama Cloud model cache and exit.
+    # Called by the OS task scheduler and by `sentinel refresh`.
+    parser.add_argument(
+        "--refresh", action="store_true",
+        help="Refresh the Ollama Cloud model cache and exit.",
+    )
     args = parser.parse_args()
+
+    # ── --refresh: run probe and exit immediately, no UI ─────────────────────
+    if args.refresh:
+        import importlib.util as _ilu
+        _probe_path = Path(__file__).parent / "scripts" / "cloud_model_probe.py"
+        _spec = _ilu.spec_from_file_location("cloud_model_probe", _probe_path)
+        _mod  = _ilu.module_from_spec(_spec)          # type: ignore[arg-type]
+        _spec.loader.exec_module(_mod)                # type: ignore[union-attr]
+        ok = _mod.run_probe(force=True, verbose=True)
+        sys.exit(0 if ok else 1)
+
+    # Resolve force_mode for online/offline from explicit flags
+    if args.online:
+        _force_io_mode = "online"
+    elif args.offline:
+        _force_io_mode = "offline"
+    else:
+        _force_io_mode = None
+
+    # Hardware mode: --hw-mode takes priority over legacy --mode
+    hw_mode_arg = args.hw_mode or args.mode
 
     _print_banner()
 
     runtime = SentinelRuntime(
         project_root=args.project or os.environ.get("SENTINEL_PROJECT_DIR") or os.getcwd(),
-        force_mode=args.mode,
+        force_mode=hw_mode_arg,
+        force_io_mode=_force_io_mode,
         skip_bootstrap=args.no_bootstrap,
     )
 
@@ -1187,6 +1672,7 @@ def main() -> None:
     if runtime._model_router:
         session.metadata["hardware_mode"] = runtime._model_router.get_hardware_profile()
     session.metadata["project_root"] = str(runtime.project_root)
+    session.metadata["sentinel_mode"] = runtime._mode
 
     try:
         ui.run()

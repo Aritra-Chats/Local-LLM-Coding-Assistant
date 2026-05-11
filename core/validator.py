@@ -80,6 +80,7 @@ def validate_tool_call(
     tool_name: str,
     params: Dict[str, Any],
     project_root: Optional[str] = None,
+    file_change_map: Optional[Any] = None,
 ) -> ValidationResult:
     """Validate a single tool call before it is dispatched.
 
@@ -93,9 +94,13 @@ def validate_tool_call(
     - All other tools: params dict presence only.
 
     Args:
-        tool_name:    Tool identifier string.
-        params:       Tool parameter dict.
-        project_root: Optional absolute path for path-scoping.
+        tool_name:       Tool identifier string.
+        params:          Tool parameter dict.
+        project_root:    Optional absolute path for path-scoping.
+        file_change_map: Optional FileChangeMap; when provided its
+                         ``resolve()`` is used as the canonical path for
+                         safety-scoping instead of re-deriving from
+                         project_root.
 
     Returns:
         :class:`ValidationResult`.
@@ -106,7 +111,7 @@ def validate_tool_call(
         )
 
     if tool_name == "write_file":
-        return _validate_write_file(params, project_root)
+        return _validate_write_file(params, project_root, file_change_map)
 
     if tool_name == "run_shell":
         cmd = params.get("command", "")
@@ -206,6 +211,7 @@ def validate_write_file_content(path: str, content: str) -> ValidationResult:
 def _validate_write_file(
     params: Dict[str, Any],
     project_root: Optional[str],
+    file_change_map: Optional[Any] = None,
 ) -> ValidationResult:
     path = params.get("path", "")
     content = params.get("content")
@@ -216,10 +222,21 @@ def _validate_write_file(
     if content is None:
         return ValidationResult.failed(f"write_file '{path}': 'content' param is missing")
 
-    # Path-scoping safety check
+    # Path-scoping safety check — prefer FileChangeMap canonical path
     if project_root:
+        # If the map already knows this path, use its canonical absolute form.
+        canonical: Optional[str] = None
+        if file_change_map is not None:
+            try:
+                canonical = file_change_map.resolve(path)
+            except Exception:
+                canonical = None
+
         try:
-            resolved = (Path(project_root).resolve() / path).resolve()
+            if canonical:
+                resolved = Path(canonical).resolve()
+            else:
+                resolved = (Path(project_root).resolve() / path).resolve()
             resolved.relative_to(Path(project_root).resolve())
         except ValueError:
             return ValidationResult.failed(

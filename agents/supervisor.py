@@ -269,10 +269,15 @@ class ConcreteSupervisorAgent(SupervisorAgent):
         step_id = str(uuid.uuid4())
 
         # ── LLM-driven extraction ────────────────────────────────────────────────
-        if self._ollama and self._model:
-            # Try up to 2 times: first with self._model, then with the
+        # In online mode the execution engine may have injected a cloud client
+        # via use_client().  Prefer it over the local Ollama client so the
+        # supervisor itself benefits from the cloud model for task parsing.
+        _active_client = self._inference_client or self._ollama
+        _active_model  = self._model
+        if _active_client and _active_model:
+            # Try up to 2 times: first with _active_model, then with the
             # best actually-installed model if the first call 404s.
-            models_to_try = [self._model]
+            models_to_try = [_active_model]
             tried: set = set()
 
             for attempt_model in models_to_try:
@@ -281,7 +286,7 @@ class ConcreteSupervisorAgent(SupervisorAgent):
                 tried.add(attempt_model)
                 try:
                     llm_prompt = _SUPERVISOR_PARSE_PROMPT.format(prompt=prompt)
-                    response = self._ollama.generate(
+                    response = _active_client.generate(
                         model=attempt_model,
                         prompt=llm_prompt,
                         # 60 s is enough for a 7B model on modest hardware;
@@ -316,11 +321,13 @@ class ConcreteSupervisorAgent(SupervisorAgent):
                     )
 
                     if is_404 and len(tried) == 1:
-                        # Self-heal: discover installed models and retry once
+                        # Self-heal: discover installed local models and retry once.
+                        # Only applicable for local Ollama clients; cloud clients
+                        # serve model names from their own catalogue and don't 404.
                         try:
                             from core.model_router import ConcreteModelRouter
                             ConcreteModelRouter.invalidate_model_cache()
-                            installed = self._ollama.list_models()
+                            installed = self._ollama.list_models() if self._ollama else []
                         except Exception:
                             installed = []
 

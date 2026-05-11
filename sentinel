@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Sentinel launcher for macOS / Linux
+#
+# PATH-safe: when the sentinel directory is added to PATH (or when this script
+# is symlinked into /usr/local/bin etc.), ROOT_DIR is resolved to the *real*
+# installation directory by following all symlinks.  The directory where you
+# *run* sentinel becomes the project root — not where sentinel is installed.
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# 1. Resolve the actual installation directory (follow all symlinks)
+#    plain 'dirname "$0"' breaks when sentinel is symlinked into PATH
+# ---------------------------------------------------------------------------
+_SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$_SCRIPT_SOURCE" ]; do
+    _SCRIPT_DIR="$(cd "$(dirname "$_SCRIPT_SOURCE")" && pwd)"
+    _SCRIPT_SOURCE="$(readlink "$_SCRIPT_SOURCE")"
+    # Handle relative symlinks
+    [[ "$_SCRIPT_SOURCE" != /* ]] && _SCRIPT_SOURCE="$_SCRIPT_DIR/$_SCRIPT_SOURCE"
+done
+ROOT_DIR="$(cd "$(dirname "$_SCRIPT_SOURCE")" && pwd)"
+
+VENV_DIR="$ROOT_DIR/.venv"
+REQ_FILE="$ROOT_DIR/requirements.txt"
+MAIN_FILE="$ROOT_DIR/main.py"
+
+# ---------------------------------------------------------------------------
+# 2. Capture caller's working directory as the project root.
+#    This is the directory where the user typed 'sentinel', NOT where sentinel
+#    is installed.  Passed via --project so SentinelRuntime always treats the
+#    invocation CWD as the project root, regardless of PATH placement.
+# ---------------------------------------------------------------------------
+ORIGINAL_CWD="$PWD"
+
+echo "Sentinel launcher (unix)"
+echo "  Installation : $ROOT_DIR"
+echo "  Project root : $ORIGINAL_CWD"
+
+# ---------------------------------------------------------------------------
+# 3. Resolve Python interpreter
+# ---------------------------------------------------------------------------
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+    PYTHON=python
+else
+    echo "Python not found. Attempting to install..."
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if command -v brew >/dev/null 2>&1; then
+            brew install python
+            PYTHON=python3
+        else
+            echo "Homebrew not found. Please install Homebrew or Python manually." >&2
+            exit 1
+        fi
+    else
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip
+            PYTHON=python3
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y python3 python3-venv python3-pip
+            PYTHON=python3
+        elif command -v pacman >/dev/null 2>&1; then
+            sudo pacman -Sy --noconfirm python python-virtualenv
+            PYTHON=python
+        else
+            echo "No supported package manager found. Install Python manually." >&2
+            exit 1
+        fi
+    fi
+fi
+
+echo "  Python       : $(${PYTHON} --version 2>&1)"
+
+# ---------------------------------------------------------------------------
+# 4. Ensure Ollama is installed
+# ---------------------------------------------------------------------------
+if ! command -v ollama >/dev/null 2>&1; then
+    echo "Ollama CLI not found. Attempting to install..."
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if command -v brew >/dev/null 2>&1; then
+            brew install ollama || {
+                echo "brew install ollama failed; install Ollama manually." >&2
+                exit 1
+            }
+        else
+            echo "Homebrew not found. Please install Homebrew or Ollama manually." >&2
+            exit 1
+        fi
+    else
+        curl -fsSL https://ollama.ai/install.sh | sh || {
+            echo "Ollama install failed; install manually." >&2
+            exit 1
+        }
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Create virtualenv inside the installation directory (not the project dir)
+# ---------------------------------------------------------------------------
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    echo "Creating virtual environment at $VENV_DIR"
+    "$PYTHON" -m venv "$VENV_DIR"
+fi
+
+PIP_CMD="$VENV_DIR/bin/pip"
+PY_EXE="$VENV_DIR/bin/python"
+
+echo "Upgrading pip..."
+"$PY_EXE" -m pip install --upgrade pip >/dev/null
+
+if [ -f "$REQ_FILE" ]; then
+    echo "Installing requirements..."
+    "$PIP_CMD" install -r "$REQ_FILE" --quiet
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Launch — pass the caller's CWD as the project root
+# ---------------------------------------------------------------------------
+echo "Launching Sentinel..."
+exec "$PY_EXE" "$MAIN_FILE" --project "$ORIGINAL_CWD" "$@"

@@ -1,5 +1,15 @@
 """ollama_client.py — HTTP client wrapper for the Ollama local API.
 
+Storage note
+------------
+Sentinel directs all locally-pulled Ollama models to
+``~/.sentinel/.ollama/models/`` by setting the ``OLLAMA_MODELS`` environment
+variable before any subprocess or daemon call.  This path is defined in
+``config.settings.SENTINEL_OLLAMA_MODELS`` and injected in
+``core.bootstrap.Bootstrap.run()``.  This client communicates with the local
+Ollama daemon at ``http://localhost:11434``; the daemon reads ``OLLAMA_MODELS``
+at startup, so no changes to this HTTP client are required.
+
 Improvements
 ------------
 * Streaming support  — generate_stream() yields text chunks; generate() can
