@@ -6,6 +6,7 @@ Supports optional line-range extraction and encoding override.
 Registered name: ``"read_file"``
 """
 
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -80,13 +81,42 @@ class ReadFileTool(Tool):
         Returns:
             ToolResult with ``output`` set to the file content string.
         """
+        # --- Glob-pattern guard -------------------------------------------
+        # If the path contains wildcard characters it is a glob pattern, NOT a
+        # real file path.  read_file cannot expand globs; the caller should use
+        # find_files instead.  Return a structured error so the execution engine
+        # (and the LLM on retry) can redirect automatically.
+        import re as _re
+        _GLOB_CHARS = re.compile(r"[\*\?\[]")
+        if _GLOB_CHARS.search(path):
+            # Extract the directory portion (everything before the first glob char)
+            # so the engine can pass it as the `path` arg to find_files.
+            _first_glob = _GLOB_CHARS.search(path).start()
+            _dir_part = path[:_first_glob].rstrip("/\\") or "."
+            _pat_part = path[_first_glob:]
+            # Strip any leading path-separator from the pattern
+            _pat_part = _pat_part.lstrip("/\\")
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                error=(
+                    f"read_file does not support glob patterns. "
+                    f"Use find_files with pattern='{_pat_part}' and path='{_dir_part}' instead."
+                ),
+                metadata={
+                    "redirect_to": "find_files",
+                    "find_files_params": {"pattern": _pat_part, "path": _dir_part},
+                },
+            )
+        # -----------------------------------------------------------------
+
         # Resolve path relative to project_root if provided and path is relative
         target_path = Path(path).expanduser()
         if project_root and not target_path.is_absolute():
             target_path = (Path(project_root) / path).resolve()
         else:
             target_path = target_path.resolve()
-            
+
         if not target_path.exists():
             return ToolResult(
                 tool_name=self.name,

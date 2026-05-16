@@ -20,13 +20,11 @@ Everything needed to run a fully functional, local AI assistant on consumer hard
 - [x] One-command bootstrap (Ollama install, model pull, workspace creation)
 - [x] 10-agent pipeline system (Supervisor, Planner, Pipeline Generator, Coding,
       Debugging, Reasoning, DevOps, Research, System, Critic)
-- [x] 14+ built-in tools (file I/O, shell, search, git, web, dependency management, project initialization)
+- [x] 12 built-in tools (file I/O, shell, search, git, web, dependency management)
 - [x] Rich interactive REPL with slash commands
 - [x] Attachment system (`@file:`, `@url:`, `@pdf:` in runtime; extended parsers in context modules)
 - [x] Session persistence (UUID session IDs)
 - [x] Learning system with EMA performance tracking
-- [x] Online/Offline mode support with automatic model discovery
-- [x] Task segregator for online mode with prompt refinement
 - [x] Flat package architecture with full type annotations
 
 ---
@@ -132,4 +130,4 @@ These are ideas on the long-term wishlist. No timeline or commitment is implied.
 
 | Version | Date | Highlights |
 |---|---|---|
-| v0.1.0 | 2025–2026 | Initial release — local inference, 10 agents, 14+ tools, online/offline modes |
+| v0.1.0 | 2026 | Initial release — local inference, 10 agents, 12 tools |

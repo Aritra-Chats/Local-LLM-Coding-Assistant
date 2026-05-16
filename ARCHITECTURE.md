@@ -10,19 +10,18 @@ This document describes the internal design of every Sentinel subsystem. It is i
 2. [Top-Level Structure](#2-top-level-structure)
 3. [Request Lifecycle](#3-request-lifecycle)
 4. [Agents Subsystem](#4-agents-subsystem)
-5. [Task Segregator](#5-task-segregator)
-6. [Task Planning](#6-task-planning)
-7. [Pipeline Generator](#7-pipeline-generator)
-8. [Execution Engine](#8-execution-engine)
-9. [Context Engine](#9-context-engine)
-10. [Tool System](#10-tool-system)
-11. [Model Router](#11-model-router)
-12. [Learning System](#12-learning-system)
-13. [Memory & Session](#13-memory--session)
-14. [Hardware Profiler](#14-hardware-profiler)
-15. [CLI Layer](#15-cli-layer)
-16. [Bootstrap](#16-bootstrap)
-17. [Data Flow Diagram](#17-data-flow-diagram)
+5. [Task Planning](#5-task-planning)
+6. [Pipeline Generator](#6-pipeline-generator)
+7. [Execution Engine](#7-execution-engine)
+8. [Context Engine](#8-context-engine)
+9. [Tool System](#9-tool-system)
+10. [Model Router](#10-model-router)
+11. [Learning System](#11-learning-system)
+12. [Memory & Session](#12-memory--session)
+13. [Hardware Profiler](#13-hardware-profiler)
+14. [CLI Layer](#14-cli-layer)
+15. [Bootstrap](#15-bootstrap)
+16. [Data Flow Diagram](#16-data-flow-diagram)
 
 ---
 
@@ -43,18 +42,18 @@ This document describes the internal design of every Sentinel subsystem. It is i
 
 ```
 local-llm-assistant/
-├── agents/       ABC + concrete: supervisor, planner, pipeline generator + 7 specialists (10 total)
+├── agents/       ABC + concrete: supervisor, planner, pipeline generator + 7 specialists
 ├── cli/          Interactive REPL, display, diff, command palette
 ├── config/       Hardware profile, model config, environment settings
 ├── context/      RAG engine, symbol graph, dependency graph, attachment loader
-├── core/         Bootstrap, execution engine, model router, validator, task segregator
+├── core/         Bootstrap, execution engine, model router, validator
 ├── execution/    Dynamic pipeline, step runner, retry handler, sandbox
 ├── learning/     Metrics tracker, pipeline optimiser, prompt A/B engine
 ├── memory/       Session store, conversation memory, project index
 ├── models/       Ollama HTTP client, embedding client, model registry
 ├── system/       Hardware detection, dependency installer, Ollama manager
 ├── tasks/        Task planner, classifier, schema re-exports
-├── tools/        14+ built-in tools + registry
+├── tools/        12 built-in tools + registry
 └── main.py       SentinelRuntime orchestrator + entry point; exposed as the sentinel console script via pyproject.toml
 ```
 
@@ -157,53 +156,7 @@ clarify     — request clarification from user
 
 ---
 
-## 5. Task Segregator
-
-**Package:** `core/`  
-**Key file:** `core/task_segregator.py`
-
-Operates in **online mode only**. Intercepts the raw user prompt before task planning and performs three sequential refinement steps:
-
-### Pipeline
-
-```
-Raw prompt (user input)
-    │
-    ▼
-TaskSegregator.decompose(prompt) → List[SegmentedTask]
-    • Splits prompt into atomic sub-tasks
-    • Estimates complexity (low / medium / high) for each
-    • Detects domain keywords (coding, debugging, etc.)
-    │
-    ▼
-TaskSegregator.refine(subtask) → RefinedPrompt
-    • Rewrites each sub-task into a precise, model-ready format
-    • Adds context from previous segments
-    │
-    ▼
-TaskSegregator.classify(subtask) → routing_domain
-    • Keyword-based fast path classification
-    • Falls back to local NLP zero-shot if confidence is low
-    │
-    ▼
-yields RefinedTask → passed to TaskPlanner.plan()
-```
-
-### Key characteristics
-
-- **Local-only** — always uses the local supervisor model, regardless of `--online` / `--offline` mode
-- **Prompt refinement** — each sub-task is rewritten for clarity and LLM efficiency
-- **Fast fallback** — keyword detection handles ≥90% of cases; only resorts to NLP for ambiguous tasks
-- **Complexity estimation** — mirrors the supervisor's complexity heuristics (keyword set + length threshold)
-
-### Used by
-
-- `SentinelRuntime.process_prompt()` when in online mode
-- Transparent to the user; operates before any pipeline generation
-
----
-
-## 6. Task Planning
+## 5. Task Planning
 
 **Package:** `tasks/`
 
@@ -254,7 +207,7 @@ TaskPlanner.plan(task) → ExecutionPlan   (public API)
 
 ---
 
-## 7. Pipeline Generator
+## 6. Pipeline Generator
 
 **Package:** `execution/`  
 **Key file:** `execution/pipeline.py` (`DynamicPipelineGenerator`)
@@ -284,7 +237,7 @@ Converts an `ExecutionPlan` into an executable `Pipeline` by:
 
 ---
 
-## 8. Execution Engine
+## 7. Execution Engine
 
 **Package:** `core/`  
 **Key file:** `core/execution_engine.py`
@@ -314,7 +267,7 @@ Returns a `PipelineRunResult` containing:
 
 ---
 
-## 9. Context Engine
+## 8. Context Engine
 
 **Package:** `context/`
 
@@ -333,7 +286,7 @@ The builder respects a per-profile **token budget** (`DEFAULT_TOKEN_BUDGET` in `
 
 ---
 
-## 10. Tool System
+## 9. Tool System
 
 **Package:** `tools/`
 
@@ -363,7 +316,6 @@ class Tool:
 | `InstallDependencyTool` | `install_dependency` | pip install a package |
 | `OpenApplicationTool` | `open_application` | Open a URL or application |
 | `ProjectInitializerTool` | `project_initializer` | Scaffold new projects using framework generators |
-| `OnlineModelDiscoveryTool` | `online_model_discovery` | Discover and select models from cloud providers |
 
 `ConcreteToolRegistry` wraps every invocation with:
 - JSON Schema input validation
@@ -372,7 +324,7 @@ class Tool:
 
 ---
 
-## 11. Model Router
+## 10. Model Router
 
 **Package:** `core/`  
 **Key file:** `core/model_router.py`
@@ -393,7 +345,7 @@ Exposes:
 
 ---
 
-## 12. Learning System
+## 11. Learning System
 
 **Package:** `learning/`
 
@@ -429,7 +381,7 @@ A/B tests prompt variants per `(agent, category)` pair:
 
 ---
 
-## 13. Memory & Session
+## 12. Memory & Session
 
 **Package:** `memory/`
 
@@ -453,7 +405,7 @@ File tree index for fast path search. Rebuilt on demand; persisted to `~/.sentin
 
 ---
 
-## 14. Hardware Profiler
+## 13. Hardware Profiler
 
 **Package:** `config/` + `system/`
 
@@ -479,7 +431,7 @@ config/hardware_profile.py   ─►  HardwareProfiler.classify(info) → Hardwar
 
 ---
 
-## 15. CLI Layer
+## 14. CLI Layer
 
 **Package:** `cli/`
 
@@ -497,7 +449,7 @@ config/hardware_profile.py   ─►  HardwareProfiler.classify(info) → Hardwar
 
 ---
 
-## 16. Bootstrap
+## 15. Bootstrap
 
 **Package:** `core/bootstrap.py`
 
@@ -517,7 +469,7 @@ On subsequent launches, presence of `~/.sentinel/.bootstrapped` skips all steps.
 
 ---
 
-## 17. Data Flow Diagram
+## 16. Data Flow Diagram
 
 ```mermaid
 %%{init: {'theme': 'neutral', 'flowchart': {'curve': 'linear'}}}%%

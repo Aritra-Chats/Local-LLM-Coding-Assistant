@@ -8,3 +8,23 @@ def test_degradation():
     st = {"routing_domain": "debugging", "complexity": "medium"}
     engine.discover(st)
     assert "provider" in st["selected_model"]
+
+
+def test_cloud_selection_uses_cloud_models():
+    from core.online_model_discovery import OnlineModelDiscoveryEngine
+
+    class CloudClient:
+        def list_models(self):
+            return [
+                {"name": "small:7b-cloud", "details": {"parameter_size": "7b"}},
+                {"name": "large:13b-cloud", "details": {"parameter_size": "13b"}},
+            ]
+
+    engine = OnlineModelDiscoveryEngine(ollama_cloud_client=CloudClient(), local_router=None)
+    engine._web_search_scores = lambda domain, complexity: {}
+
+    st = {"routing_domain": "debugging", "complexity": "medium"}
+    engine.discover(st)
+
+    assert st["selected_model"]["provider"] == "ollama_cloud"
+    assert st["selected_model"]["model"] == "large:13b-cloud"

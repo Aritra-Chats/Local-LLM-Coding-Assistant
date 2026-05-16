@@ -7,6 +7,8 @@ and a final execution summary table.
 from __future__ import annotations
 
 import time
+import queue
+import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, List, Optional
 
@@ -78,6 +80,11 @@ class ProgressTracker:
             self._pipeline_task_id: Optional[Any] = None
             # _node_task_ids used by tree-display methods (Part 5)
             self._node_task_ids: Dict[str, Any] = {}
+            self._decomp_rich_tree: Optional[Any] = None
+            self._decomp_tree_live: Optional[Any] = None
+            self._decomp_root_label: str = ""
+            self._render_queue: Optional[Any] = None
+            self._render_thread: Optional[Any] = None
             return
 
         try:
@@ -90,6 +97,11 @@ class ProgressTracker:
             self._step_timings = {}
             self._pipeline_task_id = None
             self._node_task_ids = {}
+            self._decomp_rich_tree = None
+            self._decomp_tree_live = None
+            self._decomp_root_label = ""
+            self._render_queue = None
+            self._render_thread = None
             return
 
         self._progress: Optional[Progress] = None
@@ -99,8 +111,80 @@ class ProgressTracker:
         self._pipeline_task_id: Optional[TaskID] = None
         # Tracks Rich task IDs for tree node status updates (Part 5)
         self._node_task_ids: Dict[str, Any] = {}
+        # Live decomposition-tree state
+        self._decomp_rich_tree: Optional[Any] = None
+        self._decomp_tree_live: Optional[Any] = None
+        self._decomp_root_label: str = ""
+        # Daemon render thread
+        self._render_queue: "queue.SimpleQueue[Any]" = queue.SimpleQueue()
+        self._render_thread: threading.Thread = threading.Thread(
+            target=self._render_loop, daemon=True, name="pt-render"
+        )
+        self._render_thread.start()
 
     # ------------------------------------------------------------------
+    # Daemon render thread
+    # ------------------------------------------------------------------
+
+    def _render_loop(self) -> None:
+        """Dequeue and execute rendering callables until sentinel ``None``."""
+        while True:
+            fn = self._render_queue.get()
+            if fn is None:
+                break
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _enqueue(self, fn: Any) -> None:
+        """Submit a rendering callable to the daemon render thread.
+
+        No-ops silently when the render queue is unavailable (Rich absent or
+        constructor failed).
+        """
+        if self._render_queue is not None:
+            try:
+                self._render_queue.put(fn)
+            except Exception:
+                pass
+
+    def _flush(self) -> None:
+        """Block until all enqueued render operations complete.
+
+        Enqueues a ``threading.Event`` sentinel behind all pending work and
+        waits for it, with a 5-second safety timeout.
+        """
+        if self._render_queue is not None:
+            try:
+                done = threading.Event()
+                self._render_queue.put(lambda: done.set())
+                done.wait(timeout=5.0)
+            except Exception:
+                pass
+
+    def print(self, renderable: Any) -> None:
+        """Enqueue a renderable for display on the daemon render thread.
+
+        External callers (e.g. ``tree_execution_engine``) must use this
+        method instead of accessing ``self.console.print()`` directly, so
+        that all terminal output is serialised through the render thread.
+        """
+        if self.console is not None:
+            self._enqueue(lambda r=renderable: self.console.print(r))
+
+    def shutdown(self) -> None:
+        """Send the sentinel value to stop the daemon render thread cleanly.
+
+        Optional — the daemon thread is reaped automatically when the process
+        exits. Call this for an orderly shutdown in test or REPL contexts.
+        """
+        if self._render_queue is not None:
+            try:
+                self._render_queue.put(None)
+            except Exception:
+                pass
+
     # Pipeline-level progress
     # ------------------------------------------------------------------
 
@@ -158,11 +242,143 @@ class ProgressTracker:
             self._live = Live(self._progress, console=self.console, refresh_per_second=10)
             self._live.start()
 
+    @contextmanager
+    def paused_for_input(self) -> Generator[None, None, None]:
+        """Context manager that cleanly suspends ALL live displays for user input.
+
+        Flushes the render queue, then stops both the pipeline-progress Live
+        (``self._live``) and the decomposition-tree Live
+        (``self._decomp_tree_live``) before yielding, so the terminal is fully
+        free for printing and ``input()`` calls.  Both displays are restarted
+        in the ``finally`` block — even if the body raises.
+
+        This prevents the render thread from firing ``_decomp_tree_live.refresh()``
+        while ``input()`` is blocking, which would corrupt the terminal and
+        cause the approval panel to reappear multiple times.
+
+        Usage::
+
+            with tracker.paused_for_input():
+                tracker.console.print(approval_panel)
+                answer = input("Apply? [Y/n] › ")
+        """
+        # Drain all in-flight render-queue operations before touching either
+        # Live display.  Without this a queued refresh could fire between
+        # stop() and the print/input calls below.
+        self._flush()
+
+        # ── Stop pipeline progress Live ──────────────────────────────────────
+        pipeline_was_running = (
+            self._live is not None
+            and getattr(self._live, "is_started", False)
+        )
+        if pipeline_was_running:
+            self._live.stop()
+
+        # ── Stop decomposition tree Live ─────────────────────────────────────
+        decomp_was_running = (
+            self._decomp_tree_live is not None
+            and getattr(self._decomp_tree_live, "is_started", False)
+        )
+        if decomp_was_running:
+            try:
+                self._decomp_tree_live.stop()
+            except Exception:
+                pass
+
+        try:
+            yield
+        finally:
+            # ── Resume decomposition tree Live first ─────────────────────────
+            # Restart the decomp tree before the pipeline progress bar so the
+            # z-order (tree above pipeline) is preserved in the terminal.
+            if decomp_was_running and self._decomp_rich_tree is not None:
+                try:
+                    from rich.live import Live
+                    from rich.panel import Panel as _Panel
+                    _panel = _Panel(
+                        self._decomp_rich_tree,
+                        title="Decomposition Tree",
+                        border_style="cyan",
+                        expand=True,
+                    )
+                    self._decomp_tree_live = Live(
+                        _panel,
+                        console=self.console,
+                        auto_refresh=True,
+                        refresh_per_second=2,
+                        transient=False,
+                    )
+                    self._decomp_tree_live.start()
+                except Exception:
+                    pass
+
+            # ── Resume pipeline progress Live ────────────────────────────────
+            if pipeline_was_running and self._progress is not None:
+                try:
+                    self._live = Live(
+                        self._progress, console=self.console, refresh_per_second=10
+                    )
+                    self._live.start()
+                except Exception:
+                    pass
+
     # ------------------------------------------------------------------
     # Step-level updates
     # ------------------------------------------------------------------
 
-    def start_step(self, step_index: int, description: str, provider: str = "", model: str = "") -> None:
+    def update_step_action(self, step_index: int, action_message: str) -> None:
+        """Update the live label for the currently running step.
+
+        Called before each tool dispatch so the user can see *what the agent
+        is doing right now* rather than just the static step description.
+
+        The message is trimmed to 80 characters and prepended with a bullet
+        so it fits inside the progress bar column without wrapping.
+
+        Args:
+            step_index:     The step's pipeline index (same value passed to
+                            :meth:`start_step`).
+            action_message: Short human-readable description of the current
+                            action (e.g. ``"Writing src/App.jsx"`` or the
+                            LLM-generated rationale for the action).
+        """
+        key = str(step_index)
+        if not self._progress or key not in self._task_ids:
+            return
+        # Truncate long messages so they stay on one line
+        short = action_message[:80].strip()
+        if len(action_message) > 80:
+            short += "…"
+        label = f"  [cyan]◉[/cyan] [{step_index}] [dim]{short}[/dim]"
+        try:
+            self._progress.update(self._task_ids[key], description=label)
+        except Exception:  # pragma: no cover
+            pass
+
+    def finalize_decomp_tree(self) -> None:
+        """Stop the live decomposition-tree display.
+
+        Flushes all pending render-queue operations first, then stops the
+        Live context so the final tree state is flushed to the terminal.
+        Must be called once after tree execution completes.
+        """
+        self._flush()
+        if self._decomp_tree_live is not None:
+            try:
+                self._decomp_tree_live.stop()
+            except Exception:  # pragma: no cover
+                pass
+            self._decomp_tree_live = None
+            self._decomp_rich_tree = None
+
+    def start_step(
+        self,
+        step_index: int,
+        description: str,
+        provider: str = "",
+        model: str = "",
+    ) -> None:
         """Mark a step as active in the live display.
 
         Args:
@@ -323,22 +539,21 @@ class ProgressTracker:
                 time_str,
             )
 
-        self.console.print(table)
+        self._enqueue(lambda t=table: self.console.print(t))
         overall = (
             "[bold green]Pipeline complete[/bold green]"
             if total_failed == 0
             else f"[bold red]Pipeline finished with {total_failed} failure(s)[/bold red]"
         )
-        self.console.print(
-            Panel(
-                f"{overall}\n"
-                f"[green]{total_success} succeeded[/green]  "
-                f"[red]{total_failed} failed[/red]  "
-                f"[yellow]{len(steps) - total_success - total_failed} other[/yellow]",
-                border_style="cyan",
-                expand=False,
-            )
+        _summary_panel = Panel(
+            f"{overall}\n"
+            f"[green]{total_success} succeeded[/green]  "
+            f"[red]{total_failed} failed[/red]  "
+            f"[yellow]{len(steps) - total_success - total_failed} other[/yellow]",
+            border_style="cyan",
+            expand=True,
         )
+        self._enqueue(lambda p=_summary_panel: self.console.print(p))
 
     # ------------------------------------------------------------------
     # Simple one-shot spinner
@@ -374,48 +589,116 @@ class ProgressTracker:
     # Tree decomposition display (Part 5)
     # ------------------------------------------------------------------
 
-    def display_tree(self, tree: Any) -> None:  # tree: TaskDecompositionTree
+    def display_tree(self, tree: Any, parent_description: str = "") -> None:  # tree: TaskDecompositionTree
         """Render the decomposition tree as an indented Rich Tree widget.
 
-        Called once before tree execution begins.  Each node shows its
-        ``node_id`` (first 8 chars), ``domain``, ``complexity``, and whether
-        it is a leaf or has children.
+        Called once before tree execution begins (or after lazy decomposition).
+        Each node shows its description, complexity, and whether it is a leaf
+        or has children.
 
         Args:
             tree: A :class:`~core.task_tree.TaskDecompositionTree` instance.
+            parent_description: Optional description of the parent task being decomposed.
+                               When provided, replaces the root label with a "Decomposing" heading.
         """
         if not _RICH_AVAILABLE or self.console is None:  # pragma: no cover
             return
         try:
             from rich.tree import Tree as RichTree
+            from rich.panel import Panel as _Panel
+            from rich.live import Live
 
-            def _add_node(rich_parent: Any, node: Any) -> None:
-                domain = node.task_dict.get("routing_domain",
-                                            node.task_dict.get("domain", "?"))
-                complexity = node.complexity()
-                leaf_label = "leaf" if node.is_leaf() else f"{len(node.children)} children"
-                label = (
-                    f"[dim]{node.node_id[:8]}[/dim]  "
-                    f"[cyan]{domain}[/cyan]  |  "
-                    f"[yellow]{complexity}[/yellow]  →  {leaf_label}"
+            # ── inner helper: populate a RichTree node recursively ──────────
+            def _add_node(rich_parent: Any, node: Any, _depth: int = 0) -> None:
+                desc_raw = (
+                    node.task_dict.get("refined_prompt")
+                    or node.task_dict.get("raw_description", "")
                 )
+                # Compute available width dynamically from the live console so
+                # the label uses as much space as the current terminal allows.
+                # Budget = terminal_width
+                #          - panel_borders (2)
+                #          - tree_indent   (2 chars × depth)
+                #          - fixed_suffix  (~28 chars: "  |  medium  →  N children")
+                # Clamped to [30, 120] to stay readable on tiny/wide terminals.
+                _term_w = getattr(self.console, "width", 80) or 80
+                _desc_budget = max(30, min(120, _term_w - 2 - (2 * _depth) - 28))
+                desc = (desc_raw[:_desc_budget] + "…") if len(desc_raw) > _desc_budget else desc_raw
+                complexity = node.complexity()
+                if node.is_leaf():
+                    label = (
+                        f"[dim]{desc}[/dim]  |  "
+                        f"[yellow]{complexity}[/yellow]"
+                    )
+                else:
+                    label = (
+                        f"[dim]{desc}[/dim]  |  "
+                        f"[yellow]{complexity}[/yellow]  →  "
+                        f"{len(node.children)} children"
+                    )
                 branch = rich_parent.add(label)
                 for child in node.children:
-                    _add_node(branch, child)
+                    _add_node(branch, child, _depth + 1)
 
-            root_domain = tree.root.task_dict.get(
-                "routing_domain", tree.root.task_dict.get("domain", "root"))
-            rich_tree = RichTree(
-                f"[bold green]Task Tree[/bold green]  "
-                f"[dim]{tree.root.node_id[:8]}[/dim]  "
-                f"[cyan]{root_domain}[/cyan]"
-            )
-            for child in tree.root.children:
-                _add_node(rich_tree, child)
+            # ── bootstrap: first call only ──────────────────────────────────
+            if self._decomp_tree_live is None:
+                self._decomp_root_label = (
+                    "[bold green]Task Tree[/bold green]  [dim]root[/dim]"
+                )
+                self._decomp_rich_tree = RichTree(self._decomp_root_label)
+                for child in tree.root.children:
+                    _add_node(self._decomp_rich_tree, child)
 
-            from rich.panel import Panel as _Panel
-            self.console.print(_Panel(rich_tree, title="Decomposition Tree",
-                                      border_style="cyan", expand=False))
+                panel = _Panel(
+                    self._decomp_rich_tree,
+                    title="Decomposition Tree",
+                    border_style="cyan",
+                    expand=True,
+                )
+                self._decomp_tree_live = Live(
+                    panel,
+                    console=self.console,
+                    auto_refresh=True,
+                    refresh_per_second=2,
+                    transient=False,
+                )
+                self._decomp_tree_live.start()
+
+            # ── subsequent calls: rebuild children, enqueue refresh ──────────
+            else:
+                self._decomp_rich_tree = RichTree(self._decomp_root_label)
+                for child in tree.root.children:
+                    _add_node(self._decomp_rich_tree, child)
+
+                panel = _Panel(
+                    self._decomp_rich_tree,
+                    title="Decomposition Tree",
+                    border_style="cyan",
+                    expand=True,
+                )
+                _p = panel  # capture before enqueue to avoid late-binding
+                def _do_refresh() -> None:
+                    self._decomp_tree_live.update(_p)
+                    self._decomp_tree_live.refresh()
+                self._enqueue(_do_refresh)
+
+            # ── register nodes for live status tracking ───────────────────────
+            if self._progress is not None:
+                for node in tree.post_order():
+                    if node.node_id not in self._node_task_ids:
+                        tid = self._progress.add_task(
+                            node.node_id[:8], total=1, visible=False
+                        )
+                        self._node_task_ids[node.node_id] = tid
+            else:
+                for node in tree.post_order():
+                    if node.node_id not in self._node_task_ids:
+                        desc = (
+                            node.task_dict.get("refined_prompt")
+                            or node.task_dict.get("raw_description", "?")
+                        )[:50]
+                        self._node_task_ids[node.node_id] = desc
+
         except Exception:  # pragma: no cover
             pass
 
@@ -465,7 +748,7 @@ class ProgressTracker:
         style = _STATUS_STYLES.get(status, "white")
         icon = _STATUS_ICONS.get(status, "?")
         suffix = f"  [dim]{message}[/dim]" if message else ""
-        label = f"[{style}]{icon} {node_id[:8]} — {status}{suffix}[/{style}]"
+        label = f"[{style}]{icon} {status}{suffix}[/{style}]"
 
         if self._progress and node_id in self._node_task_ids:
             self._progress.update(
@@ -474,8 +757,5 @@ class ProgressTracker:
                 visible=True,
             )
         else:
-            # Fallback: print directly when no live progress is active
-            try:
-                self.console.print(label)
-            except Exception:  # pragma: no cover
-                pass
+            # Fallback: enqueue for render thread when no live progress is active
+            self._enqueue(lambda l=label: self.console.print(l))

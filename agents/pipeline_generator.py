@@ -161,7 +161,8 @@ class ConcretePipelineGeneratorAgent(PipelineGenerator):
         """Enrich a single plan step with execution metadata.
 
         Adds ``model_hint``, ``max_retries``, ``timeout_seconds``,
-        ``can_parallelize``, ``council_agents``, and ``status``.
+        ``can_parallelize``, ``council_agents``, ``status``, and a
+        :class:`~core.step_contract.StepContract` for SDLC gating.
 
         Args:
             step: A single step dict.  Must contain at least ``"agent"``.
@@ -169,7 +170,27 @@ class ConcretePipelineGeneratorAgent(PipelineGenerator):
         Returns:
             Enriched step dict.
         """
-        return self.generator.enrich_step(step)
+        enriched = self.generator.enrich_step(step)
+
+        # Attach / build step contract
+        try:
+            from core.step_contract import StepContract
+            from agents.planner import ConcretePlannerAgent
+
+            existing_contract = enriched.get("contract") or step.get("contract")
+            if existing_contract:
+                contract = StepContract.from_dict(existing_contract)
+            else:
+                contract_dict = ConcretePlannerAgent._build_contract_from_step(enriched)
+                contract = StepContract.from_dict(contract_dict)
+
+            if contract:
+                enriched["contract"] = contract.to_dict()
+                enriched["max_fix_attempts"] = contract.max_fix_attempts
+        except Exception:
+            pass  # Never break pipeline generation for contract enrichment
+
+        return enriched
 
     def validate_pipeline(self, pipeline: List[Dict[str, Any]]) -> bool:
         """Validate the structural integrity of a pipeline (list of step dicts).

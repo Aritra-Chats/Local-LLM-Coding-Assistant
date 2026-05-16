@@ -214,6 +214,11 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
         tool_registry: Any,
         abort_on_failure: bool = False,
         progress_tracker: Optional[Any] = None,
+        # NEW parameters for iterative deepening + debugging
+        task_segregator: Optional[Any] = None,
+        agent_registry: Optional[Dict[str, Any]] = None,
+        discovery_engine: Optional[Any] = None,
+        supervisor_agent: Optional[Any] = None,
     ) -> None:
         self._engine = concrete_engine
         self._task_planner = task_planner
@@ -221,6 +226,15 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
         self._tool_registry = tool_registry
         self._abort_on_failure = abort_on_failure
         self._tracker = progress_tracker
+        self._segregator        = task_segregator
+        self._agent_registry    = agent_registry or {}
+        self._discovery_engine  = discovery_engine
+        self._supervisor_agent  = supervisor_agent
+        self._supervisor_state: Dict[str, Any] = {
+            "completed_tasks": [],
+            "changed_files": [],
+            "integration_notes": [],
+        }
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -231,10 +245,13 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
         tree: TaskDecompositionTree,
         session_context: Dict[str, Any],
     ) -> TreeRunResult:
-        """Execute all nodes in *tree* and return an aggregated result.
+        """Execute all nodes in *tree* using iterative deepening.
 
-        The post-order traversal guarantees every child is processed before
-        its parent, so integration tests can always access all child outputs.
+        Nodes are yielded in execution order by
+        :meth:`~core.task_tree.TaskDecompositionTree.execution_order_generator`.
+        Medium/high-complexity leaf nodes are lazily decomposed one level
+        deeper (using sibling context) before execution; once decomposed they
+        are put back in the pending pool and re-yielded as children.
 
         Args:
             tree:            The :class:`~core.task_tree.TaskDecompositionTree`
@@ -248,23 +265,58 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
         t0 = time.monotonic()
         tree_id = str(uuid.uuid4())
         node_results: Dict[str, NodeResult] = {}
-
-        # Changed-file accumulator keyed by node_id — populated after each
-        # leaf pipeline run and used to build integration-test file sets.
         changed_files_by_node: Dict[str, List[str]] = {}
 
-        for node in tree.post_order():
+        # Discover models for first-layer children at start of execution
+        self._discover_models_for_children(tree.root, session_context)
+
+        gen = tree.execution_order_generator()
+        for node in gen:
             self._update_status(node.node_id, "running")
             node.status = "running"
 
-            if node.is_leaf():
-                nr = self._execute_leaf(
-                    node, session_context, changed_files_by_node
+            # ── LAZY DECOMPOSITION (before execution) ────────────────────────
+            if (
+                node.is_leaf()
+                and node.complexity() != "low"
+                and self._segregator is not None
+            ):
+                sibling_context = self._build_sibling_context(
+                    node, tree, node_results, changed_files_by_node, session_context
                 )
+                try:
+                    did_decompose = self._segregator.decompose_node_with_context(
+                        node, tree, sibling_context
+                    )
+                except Exception as _decomp_exc:
+                    did_decompose = False
+                    import sys as _sys
+                    print(
+                        f"[TreeEngine] Decomposition failed for node "
+                        f"{node.node_id[:8]}: {_decomp_exc}",
+                        file=_sys.stderr,
+                    )
+
+                if did_decompose:
+                    self._discover_models_for_children(node, session_context)
+                    # Update the single live decomposition tree (no reprint)
+                    if self._tracker is not None:
+                        self._tracker.display_tree(tree)
+                    node.status = "pending"
+                    continue  # re-queue: children will be yielded before parent
+
+            # ── EXECUTION ────────────────────────────────────────────────────
+            if node.is_leaf():
+                nr = self._execute_leaf(node, session_context, changed_files_by_node)
             else:
                 nr = self._execute_internal(
                     node, session_context, changed_files_by_node, node_results
                 )
+
+            # ── POST-EXECUTION DEBUG CHECK (every node) ───────────────────────
+            debug_result = self._run_debug_check(node, nr, session_context)
+            if debug_result is not None:
+                nr = self._merge_debug_result(nr, debug_result)
 
             node_results[node.node_id] = nr
             node.status = nr.status
@@ -272,8 +324,16 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
             node.unit_test_result = nr.unit_test_result
             node.integration_test_result = nr.integration_test_result
 
-            self._update_status(node.node_id, nr.status,
-                                 nr.error or "")
+            # Notify supervisor of task completion
+            self._notify_supervisor(node, nr, changed_files_by_node.get(node.node_id, []))
+
+            # Print integration summary if this was an integration
+            if nr.status == "integrated":
+                self._print_integration_summary(
+                    node, nr, tree, node_results, changed_files_by_node
+                )
+
+            self._update_status(node.node_id, nr.status, nr.error or "")
 
             if self._abort_on_failure and nr.status == "failed":
                 break
@@ -284,11 +344,17 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
         root_result = node_results.get(tree.root.node_id)
         if root_result and root_result.status == "integrated":
             overall = "completed"
-        elif any(r.status in ("unit_tested", "integrated")
-                 for r in node_results.values()):
+        elif any(
+            r.status in ("unit_tested", "integrated")
+            for r in node_results.values()
+        ):
             overall = "partial"
         else:
             overall = "failed"
+
+        # Flush and stop the live decomposition-tree display
+        if self._tracker is not None:
+            self._tracker.finalize_decomp_tree()
 
         return TreeRunResult(
             tree_id=tree_id,
@@ -428,16 +494,21 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
         # Propagate this node's file set for ancestor integration tests
         changed_files_by_node[node.node_id] = all_changed
 
-        # Build child-result summary for the integration prompt
+        # Build child-result summary for the integration prompt (enriched)
         child_summaries: List[str] = []
         for child in node.children:
             cr = node_results.get(child.node_id)
-            desc = child.task_dict.get(
-                "raw_description",
-                child.task_dict.get("goal", f"subtask {child.node_id[:8]}"),
-            )
+            desc = child.task_dict.get("raw_description", f"subtask {child.node_id[:8]}")
             status = cr.status if cr else "unknown"
-            child_summaries.append(f"- [{status}] {desc}")
+            files = changed_files_by_node.get(child.node_id, [])
+            file_note = f" changed {len(files)} file(s)" if files else ""
+            result_note = ""
+            if cr and cr.pipeline_result:
+                result_note = cr.pipeline_result.get("child_summary", "")
+            child_summaries.append(
+                f"- [{status}{file_note}] {desc}"
+                + (f"\n  → {result_note}" if result_note else "")
+            )
 
         node_desc = node.task_dict.get(
             "raw_description", node.task_dict.get("goal", "task")
@@ -455,6 +526,87 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
             all_changed[0] if len(all_changed) == 1
             else session_context.get("project_root", ".")
         )
+
+        # ── Integration semantic merge (Change 6) ───────────────────────────
+        debug_merge_result: Optional[Dict[str, Any]] = None
+        try:
+            merge_context = {
+                "parent_description": node.task_dict.get("raw_description", "task"),
+                "parent_complexity": node.task_dict.get("complexity", "medium"),
+                "child_summaries": [
+                    {
+                        "raw_description": child.task_dict.get("raw_description", ""),
+                        "status": (node_results.get(child.node_id).status
+                                  if node_results.get(child.node_id) else "unknown"),
+                        "changed_files_count": len(changed_files_by_node.get(child.node_id, [])),
+                    }
+                    for child in node.children
+                ],
+            }
+
+            # Resolve integration agent at runtime
+            integration_agent = None
+            if hasattr(self._agent_registry, "get_best_for_task"):
+                try:
+                    integration_agent = self._agent_registry.get_best_for_task(merge_context)
+                except Exception:
+                    integration_agent = None
+
+            if integration_agent is None:
+                integration_agent = self._agent_registry.get("debugging")
+            if integration_agent is None:
+                integration_agent = self._agent_registry.get("supervisor")
+
+            if integration_agent is not None:
+                # Build merge task
+                child_lines = []
+                for child in node.children:
+                    desc = child.task_dict.get("raw_description", "")
+                    status = (node_results.get(child.node_id).status
+                             if node_results.get(child.node_id) else "unknown")
+                    files_count = len(changed_files_by_node.get(child.node_id, []))
+                    child_lines.append(f"  • {desc} [{status}, {files_count} file(s)]")
+
+                merge_task = {
+                    "goal": (
+                        f"Verify these subtask outputs integrate correctly to fulfil: "
+                        f"{node.task_dict.get('raw_description', 'task')}.\n"
+                        f"Subtasks:\n" + "\n".join(child_lines) +
+                        f"\nIntegration agent resolved: {type(integration_agent).__name__}"
+                    ),
+                }
+
+                try:
+                    # Inject inference client into integration agent before direct invocation
+                    if integration_agent is not None and self._discovery_engine is not None:
+                        try:
+                            _dbg_model_hint = {"routing_domain": "debugging", "complexity": "low"}
+                            self._discovery_engine.discover(_dbg_model_hint)
+                            _provider = _dbg_model_hint.get("selected_model", {}).get("provider", "ollama_local")
+                            if _provider != "ollama_local":
+                                        from core.execution_engine import ConcreteExecutionEngine
+                                        _client = self._engine._resolve_inference_client(
+                                            _provider,
+                                            _dbg_model_hint.get("selected_model", {}).get("model", ""),
+                                        )
+                                        if _client is not None:
+                                            integration_agent.use_client(_client)
+                        except Exception:
+                            pass  # non-fatal; agent falls back to its own client
+
+                    debug_merge_result = integration_agent.run(
+                        merge_task,
+                        {
+                            "project_root": session_context.get("project_root", "."),
+                            "session_id": session_context.get("session_id", ""),
+                            "synopsis": session_context.get("synopsis", ""),
+                        },
+                    )
+                except Exception:
+                    debug_merge_result = None
+        except Exception:
+            debug_merge_result = None
+
         try:
             integration_result = self._run_tests(test_path)
             if not integration_result.get("success", True):
@@ -482,14 +634,215 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
                 error=error,
             )
 
+        combined_child_summary = (
+            f"Integrated {len(node.children)} subtasks for: {node_desc}. "
+            + "; ".join(
+                f"{c.task_dict.get('raw_description', '?')[:60]}="
+                f"[{node_results.get(c.node_id).status if node_results.get(c.node_id) else '?'}]"
+                for c in node.children
+            )
+        )
+
         return NodeResult(
             node_id=node.node_id,
             status="integrated",
+            pipeline_result={
+                "child_summary": combined_child_summary,
+                "child_count": len(node.children),
+                "integration_merge": debug_merge_result,
+            },
             integration_test_result=integration_result,
         )
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Iterative deepening helpers
+    # ------------------------------------------------------------------
+
+    def _build_sibling_context(
+        self,
+        node: TaskNode,
+        tree: TaskDecompositionTree,
+        node_results: Dict[str, NodeResult],
+        changed_files_by_node: Dict[str, List[str]],
+        session_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build context from siblings of node that have already completed.
+
+        Args:
+            node:                 The node whose siblings to examine.
+            tree:                 The full task tree.
+            node_results:         Completed NodeResult objects.
+            changed_files_by_node: Changed-files accumulator.
+            session_context:      Session dict.
+
+        Returns:
+            A sibling_context dict ready for decompose_node_with_context().
+        """
+        if node.parent_id is None:
+            return {
+                "completed_siblings": [],
+                "project_root": session_context.get("project_root", "."),
+            }
+        try:
+            parent = tree.get_node(node.parent_id)
+            siblings = [
+                c for c in parent.children
+                if c.node_id != node.node_id
+                and c.status in ("unit_tested", "integrated", "failed")
+            ]
+        except Exception:
+            siblings = []
+
+        completed = []
+        for sib in siblings:
+            sib_result = node_results.get(sib.node_id)
+            files = changed_files_by_node.get(sib.node_id, [])
+            summary = ""
+            if sib_result:
+                pr = sib_result.pipeline_result or {}
+                summary = pr.get("child_summary", "")
+                if not summary:
+                    summary = f"Status: {sib_result.status}"
+                    if sib_result.error:
+                        summary += f". Error: {sib_result.error[:100]}"
+            completed.append({
+                "description":   sib.task_dict.get("raw_description", ""),
+                "status":        sib.status,
+                "changed_files": files[:5],
+                "result_summary": summary,
+            })
+
+        return {
+            "completed_siblings": completed,
+            "project_root": session_context.get("project_root", "."),
+            "global_completed_tasks": self._supervisor_state["completed_tasks"],
+        }
+
+    def _discover_models_for_children(
+        self,
+        parent_node: TaskNode,
+        session_context: Dict[str, Any],
+    ) -> None:
+        """Run model discovery on each child that doesn't yet have a selected_model.
+
+        Args:
+            parent_node:     The node whose children need model discovery.
+            session_context: Session dict (unused directly; kept for symmetry).
+        """
+        if self._discovery_engine is None:
+            return
+        for child in parent_node.children:
+            if not child.task_dict.get("selected_model"):
+                try:
+                    self._discovery_engine.discover(child.task_dict)
+                except Exception:
+                    pass
+
+    def _run_debug_check(
+        self,
+        node: TaskNode,
+        nr: NodeResult,
+        session_context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Invoke DebuggingAgent after every node (leaf and internal).
+
+        Advisory only — never alters node status. Returns None if unavailable.
+
+        Args:
+            node:            The node that just finished executing.
+            nr:              The NodeResult for that node.
+            session_context: Session dict.
+
+        Returns:
+            The debugging agent's result dict, or None.
+        """
+        debugging_agent = self._agent_registry.get("debugging")
+        if debugging_agent is None:
+            return None
+
+        debug_task = {
+            "goal": (
+                node.task_dict.get("refined_prompt")
+                or node.task_dict.get("raw_description", "")
+            ),
+            "description": (
+                f"Verify compilation and integration after: "
+                f"{node.task_dict.get('raw_description', '')}"
+            ),
+            "step_id":     node.node_id,
+            "name":        f"debug-check-{node.node_id[:8]}",
+            "node_status": nr.status,
+            "prior_error": nr.error or "",
+        }
+        debug_context = {
+            "project_root": session_context.get("project_root", "."),
+            "session_id":   session_context.get("session_id", ""),
+            "synopsis":     f"Post-execution debug check for node {node.node_id[:8]}.",
+            "changed_files": [],
+        }
+        try:
+            # Inject inference client into debugging agent before direct invocation
+            # (bypasses pipeline step dispatch which normally calls use_client())
+            if debugging_agent is not None and self._discovery_engine is not None:
+                try:
+                    _dbg_model_hint = {"routing_domain": "debugging", "complexity": "low"}
+                    self._discovery_engine.discover(_dbg_model_hint)
+                    _dbg_sel      = _dbg_model_hint.get("selected_model", {})
+                    _dbg_provider = _dbg_sel.get("provider", "ollama_local")
+                    _dbg_tag      = _dbg_sel.get("model", "")
+                    if _dbg_provider != "ollama_local" and _dbg_tag:
+                        # Use the full fallback chain (ollama_cloud → external
+                        # → local) so a missing OLLAMA_API_KEY does not cause a
+                        # cloud model tag to be sent to the wrong endpoint (404).
+                        # Debugging is advisory only — if no online provider is
+                        # reachable the agent stays on local Ollama.
+                        _client, _ = self._engine._resolve_with_fallback(
+                            _dbg_provider, _dbg_tag
+                        )
+                        if _client is not None and hasattr(debugging_agent, "use_client"):
+                            debugging_agent.use_client(_client)
+                except Exception:
+                    pass  # non-fatal; agent falls back to self._ollama
+
+            return debugging_agent.run(debug_task, debug_context)
+        except Exception as _dbg_exc:
+            import sys as _sys
+            print(
+                f"[TreeEngine] DebuggingAgent check failed for node "
+                f"{node.node_id[:8]}: {_dbg_exc}",
+                file=_sys.stderr,
+            )
+            return None
+
+    def _merge_debug_result(
+        self,
+        nr: NodeResult,
+        debug_result: Dict[str, Any],
+    ) -> NodeResult:
+        """Attach debug findings to NodeResult without overwriting status.
+
+        Args:
+            nr:           The original NodeResult.
+            debug_result: Output from DebuggingAgent.run().
+
+        Returns:
+            A new NodeResult with debug_result stored in pipeline_result["debug_check"].
+        """
+        if not debug_result:
+            return nr
+        pr = dict(nr.pipeline_result) if nr.pipeline_result else {}
+        pr["debug_check"] = debug_result
+        return NodeResult(
+            node_id=nr.node_id,
+            status=nr.status,
+            pipeline_result=pr,
+            unit_test_result=nr.unit_test_result,
+            integration_test_result=nr.integration_test_result,
+            error=nr.error,
+        )
+
+    # ------------------------------------------------------------------
+    # Per-node execution helpers
     # ------------------------------------------------------------------
 
     def _build_task_dict(
@@ -517,6 +870,10 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
             "selected_model": node.task_dict.get("selected_model"),
             "session_id":     session_context.get("session_id", ""),
             "project_root":   session_context.get("project_root", "."),
+            "supervisor_state": {
+                "completed_tasks": self._supervisor_state["completed_tasks"][-10:],
+                "changed_files": self._supervisor_state["changed_files"][-20:],
+            },
         }
 
     def _run_tests(self, path: str) -> Dict[str, Any]:
@@ -582,5 +939,88 @@ class ConcreteTreeExecutionEngine(TreeExecutionEngine):
             return
         try:
             self._tracker.update_node_status(node_id, status, message)
+        except Exception:  # pragma: no cover
+            pass
+
+    def _notify_supervisor(
+        self,
+        node: "TaskNode",  # noqa: F821
+        nr: NodeResult,
+        changed_files: List[str],
+    ) -> None:
+        """Notify the supervisor agent of task completion and file changes.
+
+        Args:
+            node: The completed TaskNode.
+            nr: The NodeResult from execution.
+            changed_files: List of file paths changed by this task.
+        """
+        summary_entry = {
+            "node_id": node.node_id[:8],
+            "description": node.task_dict.get("raw_description", ""),
+            "status": nr.status,
+            "changed_files": changed_files,
+            "error": nr.error or "",
+        }
+        self._supervisor_state["completed_tasks"].append(summary_entry)
+        self._supervisor_state["changed_files"].extend(changed_files)
+
+        if self._supervisor_agent is not None:
+            try:
+                self._supervisor_agent.monitor({
+                    "steps": self._supervisor_state["completed_tasks"],
+                    "current_step": len(self._supervisor_state["completed_tasks"]),
+                })
+            except Exception:
+                pass  # Supervisor notifications should not block execution
+
+    def _print_integration_summary(
+        self,
+        node: "TaskNode",  # noqa: F821
+        nr: NodeResult,
+        tree: TaskDecompositionTree,  # noqa: F821
+        node_results: Dict[str, NodeResult],
+        changed_files_by_node: Dict[str, List[str]],
+    ) -> None:
+        """Print a summary of completed integration and next steps.
+
+        Args:
+            node: The completed internal TaskNode.
+            nr: The NodeResult from execution.
+            tree: The task tree.
+            node_results: All completed NodeResult objects.
+            changed_files_by_node: Changed files per node.
+        """
+        if self._tracker is None or self._tracker.console is None:
+            return
+
+        try:
+            # Get parent description
+            desc = node.task_dict.get("raw_description", "task")[:60]
+            n_subtasks = len(node.children)
+            n_files = len(changed_files_by_node.get(node.node_id, []))
+
+            # Find next pending sibling
+            next_desc = "all siblings done - backtracking to parent"
+            try:
+                siblings = tree.siblings_of(node.node_id)
+                for sib in siblings:
+                    if sib.node_id != node.node_id and sib.status == "pending":
+                        next_desc = sib.task_dict.get("raw_description", "?")[:50]
+                        break
+            except Exception:
+                pass
+
+            # Build and print summary
+            summary = (
+                f"[bold green]Completed:[/bold green] {desc}\n"
+                f"[dim]Subtasks merged: {n_subtasks}  |  Changed files: {n_files}[/dim]\n"
+                f"[cyan]Moving to:[/cyan] {next_desc}"
+            )
+
+            from rich.panel import Panel
+            self._tracker.print(
+                Panel(summary, border_style="green", expand=True)
+            )
         except Exception:  # pragma: no cover
             pass

@@ -54,67 +54,72 @@ _DOMAIN_TO_AGENT: Dict[str, str] = {
 }
 
 
-def _pick_best_supervisor_cloud_model(cloud_models: list) -> str:
-    """Return the best cloud model tag for use as the supervisor/decomposition model.
+def _pick_best_supervisor_cloud_model(
+    cloud_models: list,
+    discovery_engine: Optional[Any] = None,
+) -> str:
+    """Return the best cloud model tag for the supervisor (uncapped).
 
-    Strategy (all runtime, no hardcoded names):
-      1. Parse the parameter count from the model tag or its ``details`` dict.
-         Scans the full tag string for NNb / NNxNNb patterns so tags like
-         ``gemma4:31b-cloud`` and ``qwen3.5:32b`` are handled correctly.
-      2. Prefer the *largest* model available — task decomposition is a
-         structured reasoning task that benefits from higher capacity.
-      3. Fall back to the first model in the list if sizes cannot be parsed.
+    Uses the same two-layer scoring pipeline as OnlineModelDiscoveryEngine:
+      Layer 1 (metadata): parameter size × complexity fit + "reasoning" keyword score
+      Layer 2 (web):      web-search benchmark mention score (via discovery_engine)
+
+    No parameter cap is applied — the supervisor benefits from the largest,
+    most capable model available.
 
     Args:
-        cloud_models: List of model dicts returned by OllamaCloudClient.list_models().
-                      Dicts may use ``"name"`` (api/tags format) or ``"id"``
-                      (/v1/models OpenAI format) — both are handled.
+        cloud_models:     List of model dicts from OllamaCloudClient.list_models().
+                          Dicts may use ``"name"`` (api/tags) or ``"id"``
+                          (/v1/models OpenAI format) — both are handled.
+        discovery_engine: Optional :class:`~core.online_model_discovery.OnlineModelDiscoveryEngine`
+                          instance.  When provided, web-search scores are included.
+                          When ``None`` (e.g. at very early startup), only metadata
+                          scoring is used.
 
     Returns:
         The base model tag (no ``:cloud`` suffix) of the selected model,
         or an empty string if the list is empty.
     """
-    import re as _re
-
-    def _param_billions(m: dict) -> float:
-        # Support both /api/tags ("name") and /v1/models ("id") key names
-        tag = m.get("name") or m.get("id") or m.get("model", "")
-
-        # 1. Try structured details field first (most accurate)
-        details  = m.get("details", {}) or {}
-        size_str = details.get("parameter_size") or details.get("parameters") or ""
-
-        # 2. Scan the full tag string for size patterns when details unavailable.
-        #    Strip :cloud suffix then search the whole string so tags like
-        #    "gemma4:31b-cloud", "qwen3.5:32b", "codellama:34b" all parse.
-        if not size_str:
-            clean = tag.replace(":cloud", "").replace("-cloud", "").upper()
-            # MoE pattern first: e.g. 8x7b
-            moe = _re.search(r"(\d+)X(\d+(?:\.\d+)?)B", clean)
-            if moe:
-                return float(moe.group(1)) * float(moe.group(2))
-            # Plain pattern: e.g. 31b, 0.5b, 675b
-            plain = _re.search(r"(\d+(?:\.\d+)?)B", clean)
-            if plain:
-                return float(plain.group(1))
-            return 0.0
-
-        s   = str(size_str).strip().upper()
-        moe = _re.match(r"(\d+)X(\d+(?:\.\d+)?)B", s)
-        if moe:
-            return float(moe.group(1)) * float(moe.group(2))
-        plain = _re.match(r"(\d+(?:\.\d+)?)B", s)
-        if plain:
-            return float(plain.group(1))
-        return 0.0
+    from core.online_model_discovery import (
+        _complexity_size_score,
+        _extract_param_count_from_model,
+        _name_keyword_score,
+    )
 
     if not cloud_models:
         return ""
-    ranked = sorted(cloud_models, key=_param_billions, reverse=True)
-    best   = ranked[0]
-    tag    = best.get("name") or best.get("id") or best.get("model", "")
+
+    # Fetch web-search scores once if a discovery engine is available
+    web_scores: dict = {}
+    if discovery_engine is not None:
+        try:
+            web_scores = discovery_engine._web_search_scores("reasoning", "high")
+        except Exception:
+            web_scores = {}
+
+    best_tag   = ""
+    best_score = -1.0
+    for m in cloud_models:
+        tag = m.get("name") or m.get("id") or m.get("model", "")
+        if not tag:
+            continue
+
+        param_b = _extract_param_count_from_model(m, tag)
+
+        # Layer 1: metadata score
+        score  = _complexity_size_score(param_b, "high")   # supervisor handles complex tasks
+        score += _name_keyword_score(tag, "reasoning")      # supervision is reasoning
+
+        # Layer 2: web-search score (cached per discovery_engine instance)
+        base_tag = tag.replace(":cloud", "").replace("-cloud", "")
+        score += web_scores.get(base_tag, 0.0)
+
+        if score > best_score:
+            best_score = score
+            best_tag   = tag
+
     # Strip :cloud and -cloud suffixes — the direct API uses bare tags
-    return _re.sub(r"[:-]cloud$", "", tag) if tag else ""
+    return re.sub(r"[:-]cloud$", "", best_tag) if best_tag else ""
 
 def _match_subtask_for_step(
     step: Any,
@@ -320,6 +325,18 @@ class SentinelRuntime:
             context_builder=self._context_builder,
         )
 
+        # Attach async supervisor watchdog (creates SupervisorBus + daemon thread).
+        # The tracker is not available yet at construction time — it is created
+        # per-run inside run_pipeline().  We pass None here; the supervisor thread
+        # will pick up the tracker reference via engine._progress_tracker at
+        # runtime since that field is set by run_pipeline() before execution.
+        try:
+            self._engine.attach_supervisor(self._supervisor)
+        except Exception as _sup_err:
+            import sys as _sys
+            print(f"[Sentinel] Warning: async supervisor could not start: {_sup_err}",
+                  file=_sys.stderr)
+
         # Part 4: Construct TreeExecutionEngine once, reusing existing components.
         from core.tree_execution_engine import ConcreteTreeExecutionEngine
         self._tree_engine = ConcreteTreeExecutionEngine(
@@ -327,6 +344,7 @@ class SentinelRuntime:
             task_planner=self._task_planner,
             pipeline_generator=self._pipeline_gen,
             tool_registry=self._tool_registry,
+            supervisor_agent=self._supervisor,
         )
         console.print("[bold green]✔ Sentinel runtime initialised.[/bold green]")
 
@@ -379,7 +397,9 @@ class SentinelRuntime:
                     _cloud_sup   = _OCC_sup()
                     _cloud_mdls  = _cloud_sup.list_models()
                     if _cloud_mdls:
-                        _best_sup = _pick_best_supervisor_cloud_model(_cloud_mdls)
+                        _best_sup = _pick_best_supervisor_cloud_model(
+                            _cloud_mdls, discovery_engine=None
+                        )
                         if _best_sup:
                             _sup_cloud_client = _cloud_sup
                             _sup_cloud_model  = _best_sup
@@ -440,7 +460,9 @@ class SentinelRuntime:
                         # Pick the best reasoning model available on the cloud:
                         # prefer the largest model (most capable for structured
                         # JSON decomposition) that the API currently serves.
-                        best_cloud_model = _pick_best_supervisor_cloud_model(cloud_models)
+                        best_cloud_model = _pick_best_supervisor_cloud_model(
+                            cloud_models, discovery_engine=None
+                        )
                         if best_cloud_model:
                             sup_client = cloud_sup
                             sup_model  = best_cloud_model
@@ -463,49 +485,15 @@ class SentinelRuntime:
                     segregator.refine(st)
                     segregator.classify(st)
 
-                # Model discovery
-                try:
-                    from models.ollama_cloud_client import OllamaCloudClient
-                    cloud_client = OllamaCloudClient()
-                except Exception:
-                    cloud_client = None
-
-                discovery = OnlineModelDiscoveryEngine(
-                    ollama_cloud_client=cloud_client,
-                    local_router=self._model_router,
-                    tool_registry=self._tool_registry,
-                )
-                for st in sub_tasks:
-                    discovery.discover(st)
-
-                # Print segregation summary
-                from rich.table import Table as _Table
-                sum_table = _Table(title="Task Segregation", border_style="green")
-                sum_table.add_column("#")
-                sum_table.add_column("Domain")
-                sum_table.add_column("Complexity")
-                sum_table.add_column("Provider : Model")
-                for i, st in enumerate(sub_tasks, 1):
-                    sel = st.get("selected_model", {})
-                    provider_model = f"{sel.get('provider', '?')} : {sel.get('model', '?')}"
-                    sum_table.add_row(
-                        str(i),
-                        st.get("routing_domain", st.get("domain", "?")),
-                        st.get("complexity", "?"),
-                        provider_model,
-                    )
-                console.print(sum_table)
-
                 # Stamp selected_model onto the task for downstream pipeline steps
                 if sub_tasks:
                     task["sub_tasks"] = sub_tasks
-                    task["selected_model"] = sub_tasks[0].get("selected_model")
             except Exception as exc:
                 console.print(f"  [yellow]⚠[/yellow] Online segregation failed ({exc}); using offline path.")
 
         # ── Part 4: Tree execution path for non-trivial tasks ────────────────
         # When complexity is not "low" (and the tree engine is available), we
-        # recursively decompose the prompt and execute via TreeExecutionEngine.
+        # iteratively decompose the prompt and execute via TreeExecutionEngine.
         # The existing flat-pipeline path runs unchanged for low-complexity
         # tasks or when SENTINEL_MODE=="offline".
         import os as _os
@@ -518,14 +506,30 @@ class SentinelRuntime:
         ):
             try:
                 from core.task_segregator import TaskSegregator as _TS
-                from core.online_model_discovery import OnlineModelDiscoveryEngine as _OMD
+                from core.online_model_discovery import (
+                    OnlineModelDiscoveryEngine as _OMD,
+                    pick_decomposition_model as _pdm,
+                )
 
                 _ollama_client = None
                 _coding_agent = self._agent_registry.get("coding")
                 if _coding_agent is not None:
                     _ollama_client = getattr(_coding_agent, "_ollama", None)
 
-                # Reuse cloud supervisor if available (same logic as segregation above)
+                # ── 6b: Resolve discovery engine ONCE per process_prompt() ───
+                try:
+                    from models.ollama_cloud_client import OllamaCloudClient as _OCCI
+                    _cloud_for_discovery = _OCCI()
+                except Exception:
+                    _cloud_for_discovery = None
+
+                _discovery = _OMD(
+                    ollama_cloud_client=_cloud_for_discovery,
+                    local_router=self._model_router,
+                    tool_registry=self._tool_registry,
+                )
+
+                # ── Resolve supervisor model with two-layer scoring ───────────
                 _sup_client = _ollama_client
                 _sup_model  = (
                     self._model_router.select_reasoning_model()
@@ -536,20 +540,56 @@ class SentinelRuntime:
                     _cloud_sup  = _OCC()
                     _cloud_mdls = _cloud_sup.list_models()
                     if _cloud_mdls:
-                        _best = _pick_best_supervisor_cloud_model(_cloud_mdls)
+                        _best = _pick_best_supervisor_cloud_model(
+                            _cloud_mdls, discovery_engine=_discovery
+                        )
                         if _best:
                             _sup_client = _cloud_sup
                             _sup_model  = _best
                 except Exception:
                     pass
 
+                # ── 6c: Resolve decomposition model (≤250B cap) ──────────────
+                _decomp_model = _sup_model  # safe fallback
+                try:
+                    _cloud_models_for_decomp = (
+                        _cloud_for_discovery.list_models()
+                        if _cloud_for_discovery else []
+                    )
+                    _decomp_candidate = _pdm(
+                        cloud_models=_cloud_models_for_decomp,
+                        domain="reasoning",
+                        complexity=task.get("complexity", "medium"),
+                        tool_registry=self._tool_registry,
+                    )
+                    if _decomp_candidate:
+                        _decomp_model = _decomp_candidate
+                except Exception:
+                    pass
+
+                console.print(
+                    f"  [cyan]→[/cyan] Decomposition model (≤250B): "
+                    f"[bold]{_decomp_model}[/bold]"
+                )
+
+                # ── 6d: Construct TaskSegregator with BOTH models ─────────────
                 _segregator = _TS(
                     ollama_client=_sup_client,
                     supervisor_model=_sup_model,
+                    decomposition_model=_decomp_model,
                 )
 
-                console.print("  [cyan]→[/cyan] Building task decomposition tree…")
-                _tree = _segregator.build_tree(task.get("goal", ""), max_depth=4)
+                # ── 6e: Build only root + one layer (lazy) ────────────────────
+                # Reuse the sub_tasks already computed by the flat segregation
+                # block above (refine/classify already applied).  This avoids
+                # calling segregate() a second time with the decomp model, which
+                # may be a vision model incapable of JSON generation.
+                _pre_seg = task.get("sub_tasks") or []
+                console.print("  [cyan]→[/cyan] Building initial task layer…")
+                _tree = _segregator.build_tree_lazy(
+                    task.get("goal", ""),
+                    pre_segregated=_pre_seg,
+                )
 
                 # Display tree structure in CLI before execution
                 try:
@@ -559,6 +599,11 @@ class SentinelRuntime:
                     self._tree_engine._tracker = _pt
                 except Exception:
                     pass
+
+                # ── 6f: Inject segregator, agent_registry, discovery engine ───
+                self._tree_engine._segregator       = _segregator
+                self._tree_engine._agent_registry   = self._agent_registry
+                self._tree_engine._discovery_engine = _discovery
 
                 _session_ctx = {
                     "session_id":   task.get("session_id", ""),
@@ -697,6 +742,9 @@ class SentinelRuntime:
             category = (pipeline.classification.get("category", "coding")
                         if hasattr(pipeline, "classification")
                         and isinstance(pipeline.classification, dict) else "coding")
+            # TreeRunResult has node_results; flat PipelineRunResult has step_results
+            if not hasattr(result, "step_results"):
+                return
             self._perf_tracker.record_pipeline_run(
                 category=category, mode=getattr(pipeline, "mode", "solo"),
                 success=result.status != "failed",
@@ -1032,23 +1080,33 @@ class SentinelRuntime:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
-    def _run_shell_realtime(self, command: str, timeout: int = 120) -> Dict[str, Any]:
+    def _run_shell_realtime(self, command: str, timeout: int = 120, watch_mode: bool = False) -> Dict[str, Any]:
         """Run shell command and stream output live to the terminal.
 
         This is used by explicit ``@shell`` prompts so users see native,
         real-time terminal output before any fallback repair flow runs.
         """
         try:
-            proc = subprocess.Popen(
-                command,
-                shell=True,
-                cwd=str(self.project_root),
-                # Passthrough stdio for true terminal behavior (interactive prompts,
-                # colors, progress bars, and native command output formatting).
-                stdin=None,
-                stdout=None,
-                stderr=None,
-            )
+            if watch_mode:
+                proc = subprocess.Popen(
+                    command,
+                    shell=True,
+                    cwd=str(self.project_root),
+                    stdin=None,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            else:
+                proc = subprocess.Popen(
+                    command,
+                    shell=True,
+                    cwd=str(self.project_root),
+                    # Passthrough stdio for true terminal behavior (interactive prompts,
+                    # colors, progress bars, and native command output formatting).
+                    stdin=None,
+                    stdout=None,
+                    stderr=None,
+                )
         except Exception as exc:
             return {
                 "success": False,
@@ -1059,6 +1117,43 @@ class SentinelRuntime:
             }
 
         try:
+            if watch_mode:
+                try:
+                    stdout_data, stderr_data = proc.communicate(timeout=max(1, timeout))
+                    stderr_text = (stderr_data or b"").decode("utf-8", errors="replace") if isinstance(stderr_data, (bytes, bytearray)) else str(stderr_data or "")
+                    stdout_text = (stdout_data or b"").decode("utf-8", errors="replace") if isinstance(stdout_data, (bytes, bytearray)) else str(stdout_data or "")
+                    return {
+                        "success": proc.returncode == 0,
+                        "returncode": int(proc.returncode or 0),
+                        "stdout": stdout_text,
+                        "stderr": stderr_text,
+                        "error": None if proc.returncode == 0 else f"Process exited with code {proc.returncode}.",
+                        "timed_out": False,
+                        "watch_mode": True,
+                    }
+                except subprocess.TimeoutExpired as exc:
+                    proc.kill()
+                    stdout_data, stderr_data = proc.communicate()
+                    def _decode_chunk(chunk: Any) -> str:
+                        if isinstance(chunk, (bytes, bytearray)):
+                            return chunk.decode("utf-8", errors="replace")
+                        return str(chunk or "")
+
+                    stdout_text = _decode_chunk(getattr(exc, "output", None))
+                    stderr_text = _decode_chunk(getattr(exc, "stderr", None))
+                    if stdout_data:
+                        stdout_text = stdout_text or _decode_chunk(stdout_data)
+                    if stderr_data:
+                        stderr_text = stderr_text or _decode_chunk(stderr_data)
+                    return {
+                        "success": True,
+                        "returncode": 0,
+                        "stdout": stdout_text,
+                        "stderr": stderr_text,
+                        "error": None,
+                        "timed_out": True,
+                        "watch_mode": True,
+                    }
             proc.wait(timeout=max(1, timeout))
         except subprocess.TimeoutExpired:
             proc.kill()
@@ -1239,6 +1334,290 @@ class SentinelRuntime:
             return None
         return self._run_shell_command_with_repair(prompt)
 
+    # ------------------------------------------------------------------
+    # Post-pipeline helpers
+    # ------------------------------------------------------------------
+
+    def _verify_changed_files(
+        self, events: List[Any], project_root: str
+    ) -> Dict[str, str]:
+        """Recursively search the project for every file the pipeline touched.
+
+        For each FileChangeEvent the engine recorded we first check whether the
+        absolute_path still exists on disk.  If it doesn't we fall back to a
+        recursive walk of *project_root* with fuzzy filename matching (same
+        strategy used by FileChangeMap.resolve).
+
+        Returns:
+            mapping of logical_path → resolved_absolute_path (or "" when the
+            file truly cannot be located).
+        """
+        import fnmatch
+
+        resolved: Dict[str, str] = {}
+        if not events:
+            return resolved
+
+        # Build a flat list of all files in the project tree (excluding noise).
+        all_disk_files: List[str] = []
+        root = Path(project_root)
+        if root.is_dir():
+            for dirpath, dirnames, filenames in os.walk(root):
+                # Skip heavy/irrelevant directories
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in {"node_modules", ".git", "__pycache__", ".next",
+                                 "dist", "build", ".venv", "venv", ".cache"}
+                ]
+                for fname in filenames:
+                    all_disk_files.append(os.path.join(dirpath, fname))
+
+        for ev in events:
+            logical = ev.logical_path
+            absolute = ev.absolute_path
+
+            # Fast path: the recorded absolute path is still valid.
+            if absolute and os.path.isfile(absolute):
+                resolved[logical] = absolute
+                continue
+
+            # Fuzzy search: match by basename (case-insensitive).
+            target_name = os.path.basename(logical).lower()
+            candidates = [
+                p for p in all_disk_files
+                if os.path.basename(p).lower() == target_name
+            ]
+
+            if len(candidates) == 1:
+                resolved[logical] = candidates[0]
+            elif len(candidates) > 1:
+                # Prefer the one whose directory component best overlaps with
+                # the logical path's parent directory name.
+                logical_parent = os.path.basename(
+                    os.path.dirname(logical)
+                ).lower()
+                ranked = sorted(
+                    candidates,
+                    key=lambda p: (
+                        os.path.basename(os.path.dirname(p)).lower()
+                        == logical_parent
+                    ),
+                    reverse=True,
+                )
+                resolved[logical] = ranked[0]
+            else:
+                # Partial-name fallback (e.g. "styles" matching "styles.css")
+                stem = os.path.splitext(target_name)[0]
+                partial = [
+                    p for p in all_disk_files
+                    if stem in os.path.basename(p).lower()
+                ]
+                resolved[logical] = partial[0] if partial else ""
+
+        return resolved
+
+    def _run_final_debug_check(
+        self,
+        verified_files: Dict[str, str],
+        project_root: str,
+        task_goal: str,
+    ) -> str:
+        """Ask the debugging model to verify cross-file references in changed files.
+
+        Reads all verified HTML/JSX/TSX files and checks that every <script>,
+        <link>, and import reference points to a file that actually exists.
+        Returns a human-readable report string.
+        """
+        import re as _re
+
+        if not verified_files:
+            return "No changed files to verify."
+
+        # Collect file contents for the files we can actually find.
+        file_snapshots: List[str] = []
+        abs_paths_set: Set[str] = set()
+        for logical, abs_path in verified_files.items():
+            if not abs_path or not os.path.isfile(abs_path):
+                continue
+            abs_paths_set.add(abs_path)
+            try:
+                content = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+                # Truncate very large files
+                if len(content) > 4000:
+                    content = content[:4000] + "\n... (truncated)"
+                file_snapshots.append(
+                    f"=== {abs_path} ===\n{content}"
+                )
+            except Exception:
+                pass
+
+        if not file_snapshots:
+            return "Changed files could not be read for verification."
+
+        # Inline reference check (fast, no LLM needed for simple cases).
+        broken_refs: List[str] = []
+        project_path = Path(project_root)
+        for logical, abs_path in verified_files.items():
+            if not abs_path or not os.path.isfile(abs_path):
+                continue
+            ext = os.path.splitext(abs_path)[1].lower()
+            if ext not in {".html", ".htm"}:
+                continue
+            try:
+                html = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+                file_dir = Path(abs_path).parent
+                # Find all src= and href= attribute values
+                refs = _re.findall(r'(?:src|href)=["\']([^"\'#?]+)["\']', html)
+                for ref in refs:
+                    if ref.startswith(("http://", "https://", "//", "data:")):
+                        continue
+                    # Resolve relative to the HTML file's directory
+                    candidate = (file_dir / ref).resolve()
+                    if not candidate.exists():
+                        # Also try resolving from project root
+                        candidate2 = (project_path / ref.lstrip("/")).resolve()
+                        if not candidate2.exists():
+                            broken_refs.append(
+                                f"  ✘  {os.path.basename(abs_path)}: '{ref}' → not found"
+                            )
+            except Exception:
+                pass
+
+        # Build the LLM-based check only when we have a client.
+        client = None
+        model = ""
+        try:
+            if self._model_router:
+                model = self._model_router.select_debugging_model()
+            debug_agent = self._agent_registry.get("debugging")
+            if debug_agent:
+                client = getattr(debug_agent, "_inference_client", None) \
+                         or getattr(debug_agent, "_ollama", None)
+        except Exception:
+            pass
+
+        llm_verdict = ""
+        if client and model and file_snapshots:
+            try:
+                combined = "\n\n".join(file_snapshots[:6])  # cap at 6 files
+                debug_prompt = (
+                    "You are a senior web developer doing a final code review.\n\n"
+                    f"Task that was completed: {task_goal}\n\n"
+                    "Below are the files that were created or modified. "
+                    "Check that:\n"
+                    "1. All HTML <script src=...> and <link href=...> references "
+                    "match actual filenames in the project.\n"
+                    "2. JavaScript and CSS are syntactically valid (no obvious errors).\n"
+                    "3. Any dynamically-referenced function names (onclick=, "
+                    "addEventListener) are defined in the included scripts.\n\n"
+                    f"Files:\n{combined}\n\n"
+                    "Respond with a concise verdict:\n"
+                    "- PASS if everything looks correct.\n"
+                    "- ISSUES FOUND followed by a short bullet list if you spot problems.\n"
+                    "Keep the response under 200 words."
+                )
+                resp = client.generate(
+                    model=model,
+                    prompt=debug_prompt,
+                    timeout=120,
+                    options={"num_predict": 512, "temperature": 0.1},
+                )
+                llm_verdict = resp.get("response", "").strip()
+            except Exception as e:
+                llm_verdict = f"(Debugging model check skipped: {e})"
+
+        parts: List[str] = []
+        if broken_refs:
+            parts.append("Reference check found issues:\n" + "\n".join(broken_refs))
+        else:
+            parts.append("Reference check: all src/href links resolved correctly.")
+        if llm_verdict:
+            parts.append(f"Debugging model verdict:\n{llm_verdict}")
+        return "\n\n".join(parts)
+
+    def _generate_conclusion(
+        self,
+        task_goal: str,
+        verified_files: Dict[str, str],
+        project_root: str,
+        debug_report: str,
+        pipeline_status: str,
+    ) -> str:
+        """Generate a Copilot-style conclusion message via the LLM.
+
+        Falls back to a structured plain-text summary when no LLM is available.
+        """
+        changed_list = [
+            abs_p for abs_p in verified_files.values() if abs_p
+        ]
+        changed_display = "\n".join(
+            f"  • {p}" for p in changed_list[:20]
+        ) or "  (no files recorded)"
+
+        # Try LLM-generated conclusion first.
+        client = None
+        model = ""
+        try:
+            if self._model_router:
+                model = (
+                    self._model_router.select_reasoning_model()
+                    or self._model_router.select_coding_model()
+                )
+            sup = self._agent_registry.get("supervisor") if self._agent_registry else None
+            if sup:
+                client = getattr(sup, "_inference_client", None) \
+                         or getattr(sup, "_ollama", None)
+        except Exception:
+            pass
+
+        if client and model:
+            try:
+                prompt_text = (
+                    "You are an AI coding assistant. A pipeline has just finished. "
+                    "Write a clear, friendly conclusion message (like GitHub Copilot "
+                    "Workspace) in plain prose — no JSON, no bullet points inside "
+                    "paragraphs.\n\n"
+                    f"Task goal: {task_goal}\n"
+                    f"Pipeline status: {pipeline_status}\n"
+                    f"Files created or modified:\n{changed_display}\n"
+                    f"Debug report:\n{debug_report}\n\n"
+                    "Your conclusion must cover (in order, using short paragraphs):\n"
+                    "1. What was done and which files were changed.\n"
+                    "2. How to run or preview the project (give the exact commands).\n"
+                    "3. Recommended next steps for the developer.\n\n"
+                    "Keep the total length under 300 words. "
+                    "Start directly with the summary — no greeting."
+                )
+                resp = client.generate(
+                    model=model,
+                    prompt=prompt_text,
+                    timeout=120,
+                    options={"num_predict": 768, "temperature": 0.4},
+                )
+                conclusion = resp.get("response", "").strip()
+                if conclusion:
+                    return conclusion
+            except Exception:
+                pass
+
+        # Fallback: structured plain-text summary.
+        lines = [
+            f"Task completed ({pipeline_status}): {task_goal}",
+            "",
+            "Files changed:",
+            changed_display,
+            "",
+            "To run the project, open the project directory and follow your "
+            "framework's standard start command (e.g. `npm start`, `python app.py`, "
+            "or open index.html in a browser).",
+            "",
+            "Next steps: review the generated files, run the test suite, and "
+            "extend the implementation as needed.",
+        ]
+        if "ISSUES FOUND" in debug_report:
+            lines += ["", "⚠ Note — the debug check found potential issues:", debug_report]
+        return "\n".join(lines)
+
     def make_task_handler(self, session: Any) -> Callable[[str], None]:
         from cli.diff_viewer import DiffViewer
         diff_viewer = DiffViewer(console=console)
@@ -1261,6 +1640,59 @@ class SentinelRuntime:
                         session.add_turn("assistant", "@shell requires a command.")
                         return
 
+                    review: Dict[str, Any] = {}
+                    if self._engine is not None and hasattr(self._engine, "review_shell_command"):
+                        try:
+                            review = self._engine.review_shell_command(
+                                "run_shell",
+                                {
+                                    "command": cmd,
+                                    "cwd": str(self.project_root),
+                                    "timeout": 120,
+                                    "shell": True,
+                                },
+                                {
+                                    "step_name": "@shell",
+                                    "project_root": str(self.project_root),
+                                },
+                            ) or {}
+                        except Exception:
+                            review = {}
+
+                    if str(review.get("decision", "")).strip().lower() == "skip":
+                        msg = review.get("reason") or "Supervisor skipped the command."
+                        console.print(Panel(
+                            f"[yellow]{msg}[/yellow]",
+                            title="[bold yellow]@shell Skipped[/bold yellow]",
+                            border_style="yellow",
+                            expand=True,
+                        ))
+                        session.pipeline_state = {
+                            "status": "completed",
+                            "summary": msg,
+                            "elapsed_ms": 0,
+                        }
+                        session.add_turn("assistant", msg)
+                        return
+
+                    if str(review.get("display_label", "")).strip():
+                        console.print(Panel(
+                            f"[bold]{review.get('display_label')}[/bold]",
+                            title="[bold cyan]@shell Review[/bold cyan]",
+                            border_style="cyan",
+                            expand=True,
+                        ))
+
+                    watch_mode = str(review.get("decision", "")).strip().lower() == "bounded_run"
+                    if watch_mode:
+                        timeout_value = review.get("timeout_seconds", 120)
+                        try:
+                            timeout_value = max(1, int(timeout_value))
+                        except (TypeError, ValueError):
+                            timeout_value = 120
+                    else:
+                        timeout_value = 120
+
                     # Warp-like UX: allow natural-language intent and translate
                     # to a concrete shell command before execution.
                     if not self._looks_like_shell_command(cmd):
@@ -1271,7 +1703,7 @@ class SentinelRuntime:
                                 f"[red]{msg}[/red]",
                                 title="[bold red]@shell Translation Failed[/bold red]",
                                 border_style="red",
-                                expand=False,
+                                expand=True,
                             ))
                             session.pipeline_state = {
                                 "status": "failed",
@@ -1281,34 +1713,47 @@ class SentinelRuntime:
                             session.add_turn("assistant", msg)
                             return
 
-                        console.print(Panel(
-                            (
-                                f"[bold]Intent:[/bold] {cmd}\n"
-                                f"[bold]Proposed command:[/bold] {translated}\n\n"
-                                "Run this command? [Y/n]"
-                            ),
-                            title="[bold cyan]@shell Proposal[/bold cyan]",
-                            border_style="cyan",
-                            expand=False,
-                        ))
-                        sys.stdout.write("  Apply? [Y/n] › ")
-                        sys.stdout.flush()
-                        answer = (sys.stdin.readline() or "").strip().lower()
-                        if answer not in ("", "y", "yes"):
-                            msg = "@shell command cancelled by user."
-                            session.pipeline_state = {
-                                "status": "failed",
-                                "summary": msg,
-                                "elapsed_ms": 0,
-                            }
-                            session.add_turn("assistant", msg)
-                            return
-                        cmd = translated
+                        if self._engine is not None and getattr(self._engine, "_auto_approve_session", False):
+                            cmd = translated
+                        else:
+                            console.print(Panel(
+                                (
+                                    f"[bold]Intent:[/bold] {cmd}\n"
+                                    f"[bold]Proposed command:[/bold] {translated}\n\n"
+                                    "Run this command? [Y/n/A]"
+                                ),
+                                title="[bold cyan]@shell Proposal[/bold cyan]",
+                                border_style="cyan",
+                                expand=True,
+                            ))
+                            sys.stdout.write("  Apply? [Y/n/A] › ")
+                            sys.stdout.flush()
+                            answer = (sys.stdin.readline() or "").strip().lower()
+                            
+                            # Handle auto-approve option
+                            if answer in ("a", "A", "Accept All", "auto-approve") and self._engine is not None:
+                                self._engine._auto_approve_session = True
+                                answer = "y"  # Convert to yes to proceed
+                            
+                            if answer not in ("", "y", "yes"):
+                                msg = "@shell command cancelled by user."
+                                session.pipeline_state = {
+                                    "status": "failed",
+                                    "summary": msg,
+                                    "elapsed_ms": 0,
+                                }
+                                session.add_turn("assistant", msg)
+                                return
+                            cmd = translated
 
                     # First run: show live terminal output exactly as command emits it.
-                    realtime = self._run_shell_realtime(cmd, timeout=120)
+                    realtime = self._run_shell_realtime(cmd, timeout=timeout_value, watch_mode=watch_mode)
                     if realtime.get("success"):
-                        summary = "@shell command executed successfully."
+                        summary = (
+                            review.get("reason")
+                            if watch_mode and review.get("reason")
+                            else "@shell command executed successfully."
+                        )
                         session.pipeline_state = {
                             "status": "completed",
                             "summary": summary,
@@ -1322,7 +1767,7 @@ class SentinelRuntime:
                         "[yellow]Command failed. Attempting to auto-fix and re-run...[/yellow]",
                         title="[bold yellow]@shell Repair[/bold yellow]",
                         border_style="yellow",
-                        expand=False,
+                        expand=True,
                     ))
                     repaired = self._repair_shell_command(
                         cmd,
@@ -1363,7 +1808,7 @@ class SentinelRuntime:
                         f"[{status_style}]{panel_text}[/{status_style}]",
                         title="[bold]run_shell[/bold] output",
                         border_style=status_style,
-                        expand=False,
+                        expand=True,
                     ))
                     summary = (
                         "@shell repaired command executed successfully."
@@ -1398,7 +1843,7 @@ class SentinelRuntime:
                             f"[red]{msg}[/red]",
                             title="[bold red]@Open Failed[/bold red]",
                             border_style="red",
-                            expand=False,
+                            expand=True,
                         ))
                         session.pipeline_state = {
                             "status": "failed",
@@ -1417,7 +1862,7 @@ class SentinelRuntime:
                             f"[green]{msg}[/green]",
                             title="[bold green]@Open Success[/bold green]",
                             border_style="green",
-                            expand=False,
+                            expand=True,
                         ))
                         session.pipeline_state = {
                             "status": "completed",
@@ -1432,7 +1877,7 @@ class SentinelRuntime:
                         f"[red]{msg}[/red]",
                         title="[bold red]@Open Failed[/bold red]",
                         border_style="red",
-                        expand=False,
+                        expand=True,
                     ))
                     session.pipeline_state = {
                         "status": "failed",
@@ -1446,23 +1891,16 @@ class SentinelRuntime:
                 result = out["result"]
 
                 # ── Per-step output ──────────────────────────────────────────
-                for sr in result.step_results:
+                # Only show actionable tool results (diffs and shell output).
+                # Agent reasoning/analysis messages are intentionally suppressed
+                # here; a single Copilot-style conclusion is generated below.
+                # TreeRunResult has node_results, not step_results — skip loop.
+                _step_results = getattr(result, "step_results", None) or []
+                for sr in _step_results:
                     if sr.status == "skipped":
                         continue
 
-                    # Agent messages (LLM reasoning/analysis text)
-                    for action in sr.actions:
-                        if action.action_type == "message":
-                            text = action.payload.get("content", "")
-                            if text and not text.startswith("[") :
-                                console.print(Panel(
-                                    text,
-                                    title=f"[bold cyan]{sr.step_name}[/bold cyan]",
-                                    border_style="cyan",
-                                    expand=False,
-                                ))
-
-                    # Tool results — file writes → diff, others → output text
+                    # Tool results — file writes → diff, run_shell/run_tests → output
                     for tr in sr.tool_results:
                         tool = tr.get("tool_name", "")
                         success = tr.get("success", False)
@@ -1471,12 +1909,9 @@ class SentinelRuntime:
                         if tool == "write_file" and success:
                             path = meta.get("path", "")
                             content_written = tr.get("output", "")
-                            # Try to render a diff against the file on disk
                             try:
                                 from pathlib import Path as _Path
                                 existing = _Path(path).read_text(encoding="utf-8", errors="replace")
-                                # content_written is summary text, not the file content.
-                                # The actual new content is in the action payload.
                                 new_content = ""
                                 for action in sr.actions:
                                     if (action.action_type == "tool_call"
@@ -1501,7 +1936,6 @@ class SentinelRuntime:
                                         f"  [green]✔[/green] Written (no diff): [dim]{path}[/dim]"
                                     )
                             except FileNotFoundError:
-                                # New file — show it as pure addition
                                 new_content = ""
                                 for action in sr.actions:
                                     if (action.action_type == "tool_call"
@@ -1524,16 +1958,7 @@ class SentinelRuntime:
                                 f"[{status_style}]{output_text}[/{status_style}]",
                                 title=f"[bold]{tool}[/bold] output · {sr.step_name}",
                                 border_style=status_style,
-                                expand=False,
-                            ))
-
-                        elif tool == "search_code" and success and tr.get("output"):
-                            results_text = str(tr["output"])[:2000]
-                            console.print(Panel(
-                                f"[dim]{results_text}[/dim]",
-                                title=f"[bold]search_code[/bold] · {sr.step_name}",
-                                border_style="dim",
-                                expand=False,
+                                expand=True,
                             ))
 
                         elif not success and tr.get("error"):
@@ -1548,18 +1973,97 @@ class SentinelRuntime:
                     title="[bold cyan]Pipeline Complete[/bold cyan]",
                     border_style=border,
                 ))
+
+                # ── Post-pipeline: locate changed files ───────────────────────
+                task_goal = ""
+                try:
+                    task_goal = out.get("pipeline", [{}])[0].get("goal", "") \
+                                or session.metadata.get("last_goal", prompt)
+                except Exception:
+                    task_goal = prompt
+
+                fcm_events: List[Any] = []
+                try:
+                    if self._engine is not None and hasattr(self._engine, "file_change_map"):
+                        fcm_events = self._engine.file_change_map.all_events()
+                except Exception:
+                    pass
+
+                verified_files: Dict[str, str] = {}
+                if fcm_events:
+                    console.print(
+                        f"  [dim]→ Locating {len(fcm_events)} changed file(s)…[/dim]"
+                    )
+                    try:
+                        verified_files = self._verify_changed_files(
+                            fcm_events, str(self.project_root)
+                        )
+                        missing = [lp for lp, ap in verified_files.items() if not ap]
+                        if missing:
+                            console.print(
+                                f"  [yellow]⚠  Could not locate: "
+                                f"{', '.join(os.path.basename(m) for m in missing[:5])}[/yellow]"
+                            )
+                    except Exception:
+                        pass
+
+                # ── Post-pipeline: debugging model verification ───────────────
+                debug_report = ""
+                if verified_files:
+                    console.print("  [dim]→ Running final code check…[/dim]")
+                    try:
+                        debug_report = self._run_final_debug_check(
+                            verified_files, str(self.project_root), task_goal
+                        )
+                        if "ISSUES FOUND" in debug_report:
+                            console.print(Panel(
+                                debug_report,
+                                title="[bold yellow]⚠ Debug Check — Issues Found[/bold yellow]",
+                                border_style="yellow",
+                                expand=True,
+                            ))
+                        else:
+                            console.print(
+                                f"  [green]✔[/green] Debug check: "
+                                f"[dim]{debug_report.splitlines()[0]}[/dim]"
+                            )
+                    except Exception:
+                        debug_report = ""
+
+                # ── Post-pipeline: Copilot-style conclusion ───────────────────
+                console.print("  [dim]→ Generating conclusion…[/dim]")
+                conclusion = ""
+                try:
+                    conclusion = self._generate_conclusion(
+                        task_goal=task_goal,
+                        verified_files=verified_files,
+                        project_root=str(self.project_root),
+                        debug_report=debug_report,
+                        pipeline_status=out["status"],
+                    )
+                except Exception:
+                    conclusion = out["summary"]
+
+                console.print(Panel(
+                    conclusion,
+                    title="[bold green]✓ What was done / How to run / Next steps[/bold green]",
+                    border_style="green",
+                    expand=True,
+                ))
+
                 session.pipeline_state = {
-                    "status": out["status"], "summary": out["summary"],
+                    "status": out["status"], "summary": conclusion,
                     "elapsed_ms": out["elapsed_ms"],
                 }
                 # Store last context for /context command
                 try:
-                    last_sr = result.step_results[-1] if result.step_results else None
+                    _sr_list = getattr(result, "step_results", None) or []
+                    last_sr = _sr_list[-1] if _sr_list else None
                     if last_sr and last_sr.output:
                         session.metadata["last_context"] = last_sr.output.get("context") or {}
                 except Exception:
                     pass
-                session.add_turn("assistant", out["summary"])
+                session.add_turn("assistant", conclusion)
             except Exception:
                 err = traceback.format_exc()
                 console.print(Panel(
@@ -1588,7 +2092,7 @@ def _print_banner() -> None:
     console.print(Panel(
         "[bold white]Sentinel[/bold white] · Local Autonomous Development Assistant\n"
         "[dim]Type a task or [bold]/help[/bold] to see available commands.[/dim]",
-        border_style="cyan", expand=False,
+        border_style="cyan", expand=True,
     ))
 
 

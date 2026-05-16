@@ -48,10 +48,18 @@ Supported project_type values:
 
 Leave project_type blank and fill in description to let the tool auto-detect the type.
 
-Example for a React app in /projects:
+IMPORTANT: Always set output_dir to the project_root value provided in the context below.
+Never use "." as output_dir — always use the actual project root path so the scaffold
+is created inside the correct directory.
+
+The scaffold runs INSIDE output_dir directly (no extra subdirectory is created).
+After project_initializer completes, write_file paths should be relative to output_dir
+itself — do NOT include the project_name as a path prefix.
+
+Example for a React app — replace <project_root> with the actual project root path:
 [
-  {"tool": "project_initializer", "params": {"project_name": "my-app", "project_type": "react", "output_dir": "/projects"}},
-  {"tool": "write_file", "params": {"path": "/projects/my-app/src/App.js", "content": "..."}}
+  {"tool": "project_initializer", "params": {"project_name": "my-app", "project_type": "react", "output_dir": "<project_root>"}},
+  {"tool": "write_file", "params": {"path": "<project_root>/src/App.js", "content": "..."}}
 ]
 
 IMPORTANT FOR NEW PROJECTS (general rules):
@@ -71,6 +79,7 @@ class CodingAgent(BaseAgent):
     name = "coding"
 
     def __init__(self, ollama_client: Optional[Any] = None, model: str = "") -> None:
+        super().__init__()
         self._ollama = ollama_client
         self._model = model
 
@@ -136,6 +145,10 @@ class CodingAgent(BaseAgent):
         project_root = context.get("project_root", "")
         synopsis = context.get("synopsis", "")
         rag_hits = context.get("rag", [])
+        project_architecture = context.get("project_architecture", "single")
+        project_dirs         = context.get("project_dirs", {})
+        known_files: list    = context.get("known_files", [])
+        workspace_snapshot: dict = context.get("workspace_snapshot", {})
         rag_text = ""
         if rag_hits:
             rag_text = "\n".join(
@@ -239,6 +252,8 @@ class CodingAgent(BaseAgent):
                 '[\n  {"tool": "write_file", "params": {"path": "client/src/__tests__/App.test.js", "content": "..."}}\n]\n'
             )
         elif is_implementation_task and (not rag_text or project_is_empty):
+            # Use forward-slashes in paths for cross-platform readability in prompts
+            _pr = project_root.replace("\\", "/") if project_root else "."
             implementation_guidance = (
                 "\n\nThis is a NEW project implementation task. Follow these steps IN ORDER:\n"
                 "1. FIRST — call project_initializer with the correct project_type to scaffold the project.\n"
@@ -246,37 +261,84 @@ class CodingAgent(BaseAgent):
                 "   node, express, fastify, python, fastapi, django, flask,\n"
                 "   react-native, expo, flutter, kotlin-android, swift-ios, electron, tauri,\n"
                 "   unity, unreal, godot (game engines return setup guidance only).\n"
-                "2. THEN — generate write_file actions to add/override custom source files.\n"
-                "3. Do NOT manually write package.json, pubspec.yaml, or build.gradle for scaffolded projects.\n"
-                "4. Only fall back to write_file + run_shell when no supported initialiser exists.\n"
-                "\nExample — React app:\n"
+                f"2. Set output_dir to \"{_pr}\" (the project root — never use \".\").\n"
+                "3. The scaffold runs INSIDE output_dir directly — no extra subdirectory is created.\n"
+                "4. THEN — generate write_file actions using ABSOLUTE paths rooted at output_dir.\n"
+                "   Do NOT prefix paths with the project_name — files sit directly inside output_dir.\n"
+                "5. Do NOT manually write package.json, pubspec.yaml, or build.gradle for scaffolded projects.\n"
+                "6. Only fall back to write_file + run_shell when no supported initialiser exists.\n"
+                f"\nExample — React app (output_dir is \"{_pr}\"; write_file paths start at output_dir):\n"
                 '[\n'
-                '  {"tool": "project_initializer", "params": {"project_name": "my-app", "project_type": "react", "output_dir": "."}},\n'
-                '  {"tool": "write_file", "params": {"path": "my-app/src/App.js", "content": "..."}}\n'
+                f'  {{"tool": "project_initializer", "params": {{"project_name": "my-app", "project_type": "react", "output_dir": "{_pr}"}}}},\n'
+                f'  {{"tool": "write_file", "params": {{"path": "{_pr}/src/App.js", "content": "..."}}}}\n'
                 ']\n'
                 "\nExample — Flutter app:\n"
                 '[\n'
-                '  {"tool": "project_initializer", "params": {"project_name": "my_app", "project_type": "flutter", "output_dir": "."}},\n'
-                '  {"tool": "write_file", "params": {"path": "my_app/lib/main.dart", "content": "..."}}\n'
+                f'  {{"tool": "project_initializer", "params": {{"project_name": "my_app", "project_type": "flutter", "output_dir": "{_pr}"}}}},\n'
+                f'  {{"tool": "write_file", "params": {{"path": "{_pr}/lib/main.dart", "content": "..."}}}}\n'
                 ']\n'
                 "\nExample — Django backend:\n"
                 '[\n'
-                '  {"tool": "project_initializer", "params": {"project_name": "mysite", "project_type": "django", "output_dir": "."}},\n'
-                '  {"tool": "write_file", "params": {"path": "mysite/mysite/settings.py", "content": "..."}}\n'
+                f'  {{"tool": "project_initializer", "params": {{"project_name": "mysite", "project_type": "django", "output_dir": "{_pr}"}}}},\n'
+                f'  {{"tool": "write_file", "params": {{"path": "{_pr}/mysite/settings.py", "content": "..."}}}}\n'
                 ']\n'
                 "\nExample — React Native app:\n"
                 '[\n'
-                '  {"tool": "project_initializer", "params": {"project_name": "MyApp", "project_type": "react-native", "output_dir": "."}},\n'
-                '  {"tool": "write_file", "params": {"path": "MyApp/App.tsx", "content": "..."}}\n'
+                f'  {{"tool": "project_initializer", "params": {{"project_name": "MyApp", "project_type": "react-native", "output_dir": "{_pr}"}}}},\n'
+                f'  {{"tool": "write_file", "params": {{"path": "{_pr}/App.tsx", "content": "..."}}}}\n'
                 ']\n'
             )
         
+        # ── Architecture-aware directory guidance ─────────────────────────────
+        arch_guidance = ""
+        if project_architecture == "fullstack" and project_dirs:
+            _fe = project_dirs.get("frontend", "").replace("\\", "/")
+            _be = project_dirs.get("backend",  "").replace("\\", "/")
+            arch_guidance = (
+                "\n\nDIRECTORY STRUCTURE — this is a FULLSTACK project:\n"
+                f"  frontend/  →  {_fe or '<project_root>/frontend'}\n"
+                f"  backend/   →  {_be or '<project_root>/backend'}\n"
+                "When writing files:\n"
+                "  • UI components, pages, styles, hooks → write to frontend/ paths\n"
+                "  • API routes, models, server code, DB config → write to backend/ paths\n"
+                "  • Config files shared by both (e.g. docker-compose.yml) → project root\n"
+                "The engine will route paths automatically, but prefix paths explicitly "
+                "with 'frontend/' or 'backend/' for clarity.\n"
+            )
+        elif project_architecture in ("frontend", "backend"):
+            arch_guidance = (
+                f"\n\nThis project is {project_architecture}-only. "
+                "Write all files directly into the project root (no frontend/ or backend/ prefix).\n"
+            )
+
+        # Build the known-files section so the agent never guesses paths.
+        # This list is populated by the execution engine after project_initializer
+        # runs (walking the scaffold) and after every successful write_file call.
+        # Without it the agent reads from root-level paths while files may live
+        # in subdirectories like public/ (CRA) or src/ (Vite).
+        known_files_text = ""
+        if known_files:
+            _listed = "\n".join(f"  {f}" for f in known_files[:120])
+            known_files_text = (
+                f"\n\nFiles that already exist in the project (use these EXACT relative paths "
+                f"for read_file / write_file — do NOT invent paths not listed here):\n{_listed}\n"
+                "If a filename is close to one that already exists, use the exact listed path instead of creating a new variant. "
+                "This is especially important for common stylesheet names like styles.css, index.css, or App.css.\n"
+                + ("  … (truncated)\n" if len(known_files) > 120 else "")
+            )
+
         prompt = (
             f"{_SYSTEM_PROMPT}\n\n"
             f"Project root: {project_root}\n"
             f"Task: {description}\n"
             + (f"Project synopsis:\n{synopsis}\n" if synopsis else "")
+            + (
+                f"Workspace snapshot:\n{workspace_snapshot.get('summary', '')}\n"
+                if workspace_snapshot else ""
+            )
             + (f"Relevant code:\n{rag_text}\n" if rag_text else "")
+            + known_files_text
+            + arch_guidance
             + implementation_guidance
         )
 
@@ -415,4 +477,4 @@ def _parse_llm_actions(raw: str, agent_name: str, step_id: str) -> List[AgentAct
     return actions or [AgentAction.message(
         f"[{agent_name}] No actions produced.",
         agent=agent_name, step_id=step_id,
-    )]
+    )]# Changed agents/coding_agent.py

@@ -94,7 +94,7 @@ Alternatives that work well: `deepseek-coder`, `qwen2.5-coder`, `llama3`, `phi3`
 - [Ollama](https://ollama.ai/download) installed and running
 - Git (optional, for git-related tools)
 
-### Quick install
+# 2. Quick install
 
 ```bash
 # 1. Clone the repository
@@ -105,12 +105,13 @@ cd Local-LLM-Coding-Assistant
 
 # 3. Start Sentinel (bootstraps automatically on first run)
 sentinel
+```
+
 On macOS / Linux make the `sentinel` script executable and add it to your PATH:
 
 ```bash
 chmod +x sentinel
 sudo ln -s "$(pwd)/sentinel" /usr/local/bin/sentinel
-```
 ```
 
 If you are already inside the repository root and want a direct launch, `python main.py` still works. If you add the Sentinel folder to PATH, PowerShell can launch `sentinel` from any directory because `sentinel.bat` lives in that folder and calls `main.py` directly.
@@ -188,7 +189,7 @@ sentinel › Explain the dependency graph of this project
 
 ```
 local-llm-assistant/
-├── agents/          Supervisor, planner, pipeline generator + 7 specialist agents (10 total)
+├── agents/          Supervisor, planner, pipeline generator + 6 specialist agents
 ├── cli/             Interactive REPL, display helpers, diff viewer, command palette
 ├── config/          Hardware profile, model catalogue, runtime settings
 ├── context/         RAG search, symbol graph, dependency graph, attachment loader
@@ -199,7 +200,7 @@ local-llm-assistant/
 ├── models/          Ollama client, embedding client, model registry
 ├── system/          Hardware detector, dependency installer, Ollama manager
 ├── tasks/           Task planner, classifier, schema definitions
-├── tools/           14+ built-in tools: read/write, search, shell, git, web, project init, …
+├── tools/           12 built-in tools: read/write, search, shell, git, web, …
 ├── tests/           Test suite skeleton
 ├── main.py          Entry point & runtime orchestrator
 ├── sentinel.bat     Windows launcher for PATH-based use

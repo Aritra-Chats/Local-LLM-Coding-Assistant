@@ -118,13 +118,23 @@ Goal: {goal}
 Category: {category}
 Complexity: {complexity}
 
-Respond ONLY with a valid JSON array of steps. Each step must have:
+Respond ONLY with a valid JSON array of steps. Each step must have ALL of these fields:
 {{
   "name": "<short action verb phrase>",
   "description": "<what this step does and why>",
   "agent": "<one of: coding, debugging, reasoning, devops, research, system>",
   "tools": ["<tool names this step will likely need>"],
-  "depends_on": []
+  "depends_on": [],
+  "entry_requirements": [
+    "<precondition 1 — e.g. 'node >= 16 is installed'>",
+    "<precondition 2 — e.g. 'output_dir is writable'>"
+  ],
+  "exit_criteria": [
+    "<postcondition 1 — e.g. 'package.json exists at project_root'>",
+    "<postcondition 2 — e.g. 'src/index.js exists'>"
+  ],
+  "required_system_tools": ["<CLI tools needed on PATH, e.g. node, npm, git>"],
+  "expected_artifacts": ["<relative paths that must exist after step, e.g. package.json, index.html>"]
 }}
 
 Rules:
@@ -139,6 +149,9 @@ Rules:
   Supported project types: react, react-ts, vite, nextjs, vue, angular, svelte,
   node, express, fastify, python, fastapi, django, flask,
   react-native, expo, flutter, kotlin-android, swift-ios, electron, tauri, unity, unreal, godot.
+- entry_requirements and exit_criteria must be concrete and checkable (file existence, tool presence)
+- required_system_tools: only list tools actually needed (node/npm for JS, python for Python, git for commits)
+- expected_artifacts: relative paths from project_root (e.g. "package.json", "src/index.js")
 - Return between 2 and 10 steps depending on complexity
 - No prose before or after the JSON array."""
 
@@ -164,6 +177,7 @@ class ConcretePlannerAgent(PlannerAgent):
         ollama_client: Optional[Any] = None,
         model: str = "",
     ) -> None:
+        super().__init__()
         self.task_planner = TaskPlanner()
         self._ollama = ollama_client
         self._model = model
@@ -289,12 +303,14 @@ class ConcretePlannerAgent(PlannerAgent):
                     raw = __import__("re").sub(r"^```[a-zA-Z]*\n?", "", raw).rstrip("` \n")
                 steps = json.loads(raw)
                 if isinstance(steps, list) and steps:
-                    # Normalise and add step IDs
+                    # Normalise and add step IDs + contracts
                     for i, step in enumerate(steps):
                         step.setdefault("step_id", str(uuid.uuid4()))
                         step.setdefault("index", i)
                         step.setdefault("depends_on", [steps[j]["step_id"] for j in range(i)])
                         step["_decomposed_by"] = "llm"
+                        # Attach/enrich contract from the LLM-provided fields
+                        step["contract"] = ConcretePlannerAgent._build_contract_from_step(step)
                     return steps
             except Exception as _llm_err:
                 # Log reason but continue to keyword-based fallback so the
@@ -312,6 +328,7 @@ class ConcretePlannerAgent(PlannerAgent):
         result = [s.to_dict() for s in subtasks]
         for s in result:
             s["_decomposed_by"] = "keyword"
+            s.setdefault("contract", ConcretePlannerAgent._build_contract_from_step(s))
         return result
 
     def assign_agents(self, steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -367,3 +384,83 @@ class ConcretePlannerAgent(PlannerAgent):
             return declared
         plan = self.task_planner.plan(task)
         return plan.complexity
+
+    # ------------------------------------------------------------------
+    # Contract helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_contract_from_step(step: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a StepContract dict from a step dict (LLM or keyword-generated).
+
+        Merges any contract fields already on the step dict with rule-based
+        inferences derived from the step's agent type and description keywords.
+
+        Args:
+            step: A plan step dict (may already carry entry_requirements etc.)
+
+        Returns:
+            A dict suitable for passing to ``StepContract.from_dict()``.
+        """
+        desc   = (step.get("description", "") + " " + step.get("name", "")).lower()
+        agent  = step.get("agent", "coding")
+        tools  = step.get("tools", [])
+
+        # Start from LLM-provided values (may be empty lists)
+        entry_reqs  = list(step.get("entry_requirements", []))
+        exit_crit   = list(step.get("exit_criteria", []))
+        sys_tools   = list(step.get("required_system_tools", []))
+        artifacts   = list(step.get("expected_artifacts", []))
+
+        # ── Rule-based inference ───────────────────────────────────────────
+        # System tool inference from agent + description keywords
+        _node_keywords = ("react", "vite", "vue", "angular", "svelte", "nextjs",
+                          "next.js", "node", "npm", "npx", "express", "fastify",
+                          "electron", "tauri", "typescript", "javascript", "jsx", "tsx")
+        _python_keywords = ("python", "fastapi", "django", "flask", "pip", "pytest")
+        _git_keywords = ("git", "commit", "push", "branch", "merge")
+        _flutter_keywords = ("flutter", "dart")
+
+        if any(k in desc for k in _node_keywords) or "project_initializer" in tools:
+            if "node" not in sys_tools:
+                sys_tools.append("node")
+            if "npm" not in sys_tools:
+                sys_tools.append("npm")
+        if any(k in desc for k in _python_keywords):
+            if "python" not in sys_tools and "python3" not in sys_tools:
+                sys_tools.append("python")
+        if any(k in desc for k in _git_keywords) or "git_commit" in tools:
+            if "git" not in sys_tools:
+                sys_tools.append("git")
+        if any(k in desc for k in _flutter_keywords):
+            if "flutter" not in sys_tools:
+                sys_tools.append("flutter")
+
+        # Entry requirement inference
+        if "node" in sys_tools and not any("node" in r.lower() for r in entry_reqs):
+            entry_reqs.append("node is installed")
+        if "npm" in sys_tools and not any("npm" in r.lower() for r in entry_reqs):
+            entry_reqs.append("npm is installed")
+        if "git" in sys_tools and not any("git" in r.lower() for r in entry_reqs):
+            entry_reqs.append("git is installed")
+        if "write" in desc or "create" in desc or "scaffold" in desc:
+            if not any("writable" in r.lower() for r in entry_reqs):
+                entry_reqs.append("output_dir is writable")
+
+        # Exit criteria / artifact inference
+        if "project_initializer" in tools:
+            if not any("package.json" in a for a in artifacts):
+                artifacts.append("package.json")
+            if not exit_crit:
+                exit_crit.append("project scaffold directory exists")
+        if "git_commit" in tools:
+            if not any(".git" in c.lower() for c in exit_crit):
+                exit_crit.append(".git directory exists")
+
+        return {
+            "entry_requirements":    entry_reqs,
+            "exit_criteria":         exit_crit,
+            "required_system_tools": sys_tools,
+            "expected_artifacts":    artifacts,
+            "max_fix_attempts":      3,
+        }

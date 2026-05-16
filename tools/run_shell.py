@@ -108,6 +108,15 @@ class RunShellTool(Tool):
             "required": False,
             "default": False,
         },
+        "watch_mode": {
+            "type": "bool",
+            "description": (
+                "Treat a timeout as a successful bounded watch/check instead of "
+                "a hard failure. Useful for long-lived dev servers or compile checks."
+            ),
+            "required": False,
+            "default": False,
+        },
     }
 
     def run(  # type: ignore[override]
@@ -117,6 +126,7 @@ class RunShellTool(Tool):
         timeout: int = _DEFAULT_TIMEOUT,
         env_extra: Optional[Dict[str, str]] = None,
         shell: bool = False,
+        watch_mode: bool = False,
         **_: Any,
     ) -> ToolResult:
         """Run *command* and return captured output.
@@ -127,6 +137,8 @@ class RunShellTool(Tool):
             timeout: Maximum execution time in seconds.
             env_extra: Additional environment variables.
             shell: Whether to invoke via the OS shell.
+            watch_mode: When True, a timeout is treated as a bounded check that
+                succeeds after the timeout elapses.
 
         Returns:
             ToolResult with ``output`` as a dict containing ``stdout``,
@@ -197,6 +209,20 @@ class RunShellTool(Tool):
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:
+            if watch_mode:
+                return ToolResult(
+                    tool_name=self.name,
+                    success=True,
+                    output={
+                        "stdout": "",
+                        "stderr": "",
+                        "returncode": None,
+                        "timed_out": True,
+                        "watch_mode": True,
+                    },
+                    error=None,
+                    metadata={"command": command, "timeout": timeout, "watch_mode": True},
+                )
             return ToolResult(
                 tool_name=self.name,
                 success=False,
@@ -225,5 +251,5 @@ class RunShellTool(Tool):
             success=success,
             output={"stdout": stdout, "stderr": stderr, "returncode": result.returncode},
             error=None if success else f"Process exited with code {result.returncode}.",
-            metadata={"command": command, "cwd": str(cwd), "timeout": timeout},
+            metadata={"command": command, "cwd": str(cwd), "timeout": timeout, "watch_mode": watch_mode},
         )

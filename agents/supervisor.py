@@ -4,10 +4,16 @@ import re
 import traceback
 import uuid
 from abc import abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from agents.agent_action import AgentAction
 from agents.base_agent import BaseAgent
+
+if TYPE_CHECKING:
+    from core.supervisor_bus import SupervisorBus, BusEvent, FixProposal
+    from core.async_supervisor import AsyncSupervisorLoop
+    from core.execution_engine import ConcreteExecutionEngine
+    from cli.progress_tracker import ConcreteProgressTracker
 
 
 class SupervisorAgent(BaseAgent):
@@ -110,13 +116,35 @@ _LOW_COMPLEXITY_KEYWORDS = frozenset(
     {"explain", "summarise", "summarize", "describe", "what is", "show", "list"}
 )
 
+_HIGH_LENGTH_THRESHOLD = 300
+_COMPLEX_LENGTH_THRESHOLD = 600
+
 
 def _estimate_complexity(goal: str) -> str:
     lower = goal.lower()
+    plen = len(goal)
+
+    # 1. High-keyword + long goal -> complex
+    if any(k in lower for k in _HIGH_COMPLEXITY_KEYWORDS) and plen >= _HIGH_LENGTH_THRESHOLD:
+        return "complex"
+
+    # 2. Extremely long goals -> complex
+    if plen >= _COMPLEX_LENGTH_THRESHOLD:
+        return "complex"
+
+    # 3. High-keyword present -> high
     if any(k in lower for k in _HIGH_COMPLEXITY_KEYWORDS):
         return "high"
+
+    # 4. Moderately long goals -> high
+    if plen >= _HIGH_LENGTH_THRESHOLD:
+        return "high"
+
+    # 5. Low-keyword present -> low
     if any(k in lower for k in _LOW_COMPLEXITY_KEYWORDS):
         return "low"
+
+    # Default
     return "medium"
 
 
@@ -133,7 +161,7 @@ User request: {prompt}
 Respond ONLY with a valid JSON object with these exact keys:
 {{
   "goal": "<concise one-line summary of what needs to be done>",
-  "complexity": "<one of: low, medium, high>",
+    "complexity": "<one of: low, medium, high, complex>",
   "constraints": ["<any stated constraints or requirements>"],
   "task_category": "<one of: coding, debugging, reasoning, devops, research, system>",
   "affected_files": ["<list any specific files mentioned, or empty list>"],
@@ -142,7 +170,7 @@ Respond ONLY with a valid JSON object with these exact keys:
 
 Rules:
 - goal must be action-oriented and specific (not just a restatement)
-- complexity: low=simple change, medium=multi-file/multi-step, high=architectural/large-scale
+ - complexity: one of low, medium, high, complex — assessed holistically from the goal and context, not by keyword matching
 - No prose before or after the JSON object."""
 
 
@@ -164,6 +192,7 @@ class ConcreteSupervisorAgent(SupervisorAgent):
         ollama_client: Optional[Any] = None,
         model: str = "",
     ) -> None:
+        super().__init__()
         self.max_retries = max_retries
         self._ollama = ollama_client
         self._model = model
@@ -473,3 +502,283 @@ class ConcreteSupervisorAgent(SupervisorAgent):
             step_id=step_id,
         )
         return {"actions": [action], "strategy": "abort"}
+
+    # ------------------------------------------------------------------
+    # Async supervisor integration
+    # ------------------------------------------------------------------
+
+    _DIAGNOSIS_PROMPT = """\
+You are a senior software engineer diagnosing a build failure in an automated
+coding pipeline.
+
+## Failed step
+Name: {step_name}
+Agent: {agent}
+
+## Tool that failed
+Tool: {tool_name}
+Parameters: {params_json}
+
+## Error output
+{error}
+
+## System context
+Available tools in this pipeline: run_shell, write_file, read_file, find_files,
+install_dependency, project_initializer, run_tests, git_commit
+
+## Recent shell command history
+{shell_history}
+
+## Instructions
+Analyse the error and propose the minimum sequence of tool calls needed to fix
+the root cause so the original step can succeed on retry.
+
+Respond ONLY with a valid JSON object:
+{{
+  "root_cause": "<one sentence>",
+  "fix_possible": true | false,
+  "fix_rationale": "<why this fix will work>",
+  "fix_actions": [
+    {{
+      "tool": "<tool_name>",
+      "params": {{ }},
+      "rationale": "<why this specific call>"
+    }}
+  ]
+}}
+
+Rules:
+- fix_actions must be ordered (each action may depend on prior ones)
+- If fix_possible is false, fix_actions must be empty
+- Never suggest re-running the original failed tool as a fix action
+- If the required recovery would repeat a shell command already present in the
+    history, skip it instead of proposing it again.
+- Prefer install_dependency over run_shell for package installation
+- Maximum 4 fix actions
+"""
+
+    _SHELL_REVIEW_PROMPT = """\
+You are a senior software engineer reviewing a proposed shell-like tool call
+inside an automated coding pipeline.
+
+## Tool call
+Tool: {tool_name}
+Parameters: {params_json}
+
+## Recent shell command history
+{shell_history}
+
+## System context
+{context_json}
+
+## Instructions
+Decide whether the command should run, be skipped because it is already in
+history, or be treated as a bounded watch/check command.
+
+Rules:
+- If the command is already present in the shell command history, return
+    decision="skip" and do not repeat it.
+- If Tool is "project_initializer" and the context indicates an existing
+    stack/known files, return decision="skip".
+- If the command is a long-lived dev/watch process such as a local app server,
+    return decision="bounded_run" with timeout_seconds between 60 and 120 and
+    a short display label such as "Checking compilation".
+- Otherwise return decision="run".
+- Do not invent new shell commands unless you return decision="run".
+
+Respond ONLY with valid JSON:
+{{
+    "decision": "run" | "skip" | "bounded_run",
+    "timeout_seconds": 120,
+    "display_label": "<short UI label>",
+    "reason": "<one sentence>",
+    "rewrite_command": "<optional command text>"
+}}
+"""
+
+    def diagnose_failure(self, event: "BusEvent") -> "FixProposal":
+        """Call the LLM with a structured diagnosis prompt and return a FixProposal.
+
+        On LLM failure or JSON parse error returns a FixProposal with
+        ``fix_possible=False`` so the caller can abort cleanly.
+
+        Args:
+            event: The :class:`~core.supervisor_bus.BusEvent` that triggered
+                the diagnosis.
+
+        Returns:
+            :class:`~core.supervisor_bus.FixProposal` with AgentAction instances
+            ready to inject into the engine.
+        """
+        import sys
+        from core.supervisor_bus import FixProposal
+
+        step_name = event.step_name
+        tool_name = event.tool_name
+        error     = event.error
+        params    = event.extra.get("params", {})
+        step_id   = event.step_id
+
+        # Active client: prefer the injected inference client, fall back to Ollama.
+        _client = self._inference_client or self._ollama
+        _model  = self._model
+
+        if not _client or not _model:
+            return FixProposal(
+                fix_actions=[],
+                rationale="No LLM client available for diagnosis.",
+                fix_possible=False,
+            )
+
+        try:
+            shell_history = json.dumps(
+                event.context.get("shell_command_history", []) or [],
+                indent=2,
+                default=str,
+            )[:1200]
+            prompt_text = self._DIAGNOSIS_PROMPT.format(
+                step_name=step_name,
+                agent=event.extra.get("agent", "unknown"),
+                tool_name=tool_name,
+                params_json=json.dumps(params, indent=2, default=str)[:800],
+                error=error[:1200],
+                shell_history=shell_history,
+            )
+            response = _client.generate(
+                model=_model,
+                prompt=prompt_text,
+                timeout=60,
+                options={"num_predict": 1024, "temperature": 0.1},
+            )
+            raw = response.get("response", "").strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw).rstrip("` \n")
+
+            parsed = json.loads(raw)
+
+            if not parsed.get("fix_possible", False):
+                return FixProposal(
+                    fix_actions=[],
+                    rationale=parsed.get("root_cause", "No fix found by supervisor."),
+                    fix_possible=False,
+                )
+
+            # Convert raw action dicts → AgentAction instances
+            fix_actions = []
+            for raw_action in parsed.get("fix_actions", [])[:4]:
+                act = AgentAction.tool_call(
+                    tool=raw_action["tool"],
+                    params=raw_action.get("params", {}),
+                    agent=self.name,
+                    step_id=step_id,
+                    rationale=raw_action.get("rationale", ""),
+                )
+                fix_actions.append(act)
+
+            return FixProposal(
+                fix_actions=fix_actions,
+                rationale=parsed.get("fix_rationale", parsed.get("root_cause", "")),
+                retry_original=True,
+                fix_possible=True,
+            )
+
+        except Exception as exc:
+            print(
+                f"[SupervisorAgent] diagnose_failure failed "
+                f"({type(exc).__name__}: {exc}) — no fix available.",
+                file=sys.stderr,
+            )
+            return FixProposal(
+                fix_actions=[],
+                rationale=f"Diagnosis error: {exc}",
+                fix_possible=False,
+            )
+
+    def review_shell_tool_call(self, tool_name: str, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        """Ask the model whether a shell-like tool call should run now.
+
+        The response is a small runtime policy dict that the execution engine
+        can use to skip duplicates or bound watch processes.
+        """
+        import sys
+
+        _client = self._inference_client or self._ollama
+        _model = self._model
+        if not _client or not _model:
+            return {}
+
+        try:
+            shell_history = context.get("shell_command_history", []) or []
+            prompt_text = self._SHELL_REVIEW_PROMPT.format(
+                tool_name=tool_name,
+                params_json=json.dumps(params, indent=2, default=str)[:1200],
+                shell_history=json.dumps(shell_history, indent=2, default=str)[:1200],
+                context_json=json.dumps(
+                    {
+                        "step_name": context.get("step_name", ""),
+                        "step_index": context.get("step_index", -1),
+                        "project_root": context.get("project_root", ""),
+                        "workspace_snapshot": context.get("workspace_snapshot", {}),
+                        "known_files_count": len(context.get("known_files", []) or []),
+                    },
+                    indent=2,
+                    default=str,
+                )[:1200],
+            )
+            response = _client.generate(
+                model=_model,
+                prompt=prompt_text,
+                timeout=45,
+                options={"num_predict": 512, "temperature": 0.1},
+            )
+            raw = response.get("response", "").strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw).rstrip("` \n")
+            parsed = json.loads(raw)
+            decision = str(parsed.get("decision", "")).strip().lower()
+            timeout_seconds = parsed.get("timeout_seconds", 120)
+            try:
+                timeout_seconds = max(1, int(timeout_seconds))
+            except (TypeError, ValueError):
+                timeout_seconds = 120
+            display_label = str(parsed.get("display_label", "")).strip()
+            reason = str(parsed.get("reason", "")).strip()
+            rewrite_command = str(parsed.get("rewrite_command", "")).strip()
+            if decision not in {"run", "skip", "bounded_run"}:
+                decision = "run"
+            return {
+                "decision": decision,
+                "timeout_seconds": timeout_seconds,
+                "display_label": display_label,
+                "reason": reason,
+                "rewrite_command": rewrite_command,
+            }
+        except Exception as exc:
+            print(
+                f"[SupervisorAgent] review_shell_tool_call failed "
+                f"({type(exc).__name__}: {exc}) — defaulting to run.",
+                file=sys.stderr,
+            )
+            return {}
+
+    def start_async_monitoring(
+        self,
+        bus: "SupervisorBus",
+        engine: "ConcreteExecutionEngine",
+        tracker: Optional["ConcreteProgressTracker"] = None,
+    ) -> "AsyncSupervisorLoop":
+        """Create, start, and return the :class:`~core.async_supervisor.AsyncSupervisorLoop`.
+
+        Args:
+            bus: The shared :class:`~core.supervisor_bus.SupervisorBus`.
+            engine: The running :class:`~core.execution_engine.ConcreteExecutionEngine`.
+            tracker: Optional progress tracker for live UI label updates.
+
+        Returns:
+            The started (daemon thread running) :class:`~core.async_supervisor.AsyncSupervisorLoop`.
+        """
+        from core.async_supervisor import AsyncSupervisorLoop
+        loop = AsyncSupervisorLoop(supervisor=self, bus=bus, engine=engine, tracker=tracker)
+        loop.start()
+        return loop
+# Changed agents/supervisor.py

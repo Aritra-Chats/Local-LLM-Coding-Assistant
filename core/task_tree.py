@@ -255,6 +255,83 @@ class TaskDecompositionTree:
         return all(c.status in _COMPLETE for c in parent.children)
 
     # ------------------------------------------------------------------
+    # Lazy execution ordering (iterative deepening)
+    # ------------------------------------------------------------------
+
+    def _iter_bfs(self) -> List[TaskNode]:
+        """Return all nodes in BFS order as a fresh snapshot (re-reads tree).
+
+        Because execution_order_generator may have new children added between
+        yields, this always re-traverses the tree from the root.
+
+        Returns:
+            List of :class:`TaskNode` objects in breadth-first order.
+        """
+        from collections import deque
+        result: List[TaskNode] = []
+        q: deque = deque([self.root])
+        while q:
+            n = q.popleft()
+            result.append(n)
+            q.extend(n.children)
+        return result
+
+    def _iter_dfs(self) -> List[TaskNode]:
+        """Return all nodes in pre-order DFS order as a fresh snapshot.
+
+        Pre-order DFS ensures that after a node is lazily decomposed, its
+        children appear before its siblings in the scan, giving the expected
+        depth-first execution order.
+        """
+        result: List[TaskNode] = []
+
+        def _visit(n: TaskNode) -> None:
+            result.append(n)
+            for child in n.children:
+                _visit(child)
+
+        _visit(self.root)
+        return result
+
+    def execution_order_generator(self):
+        """Yield next-ready node one at a time. Caller loops until exhausted.
+
+        Ordering (post-order compatible with lazy decomposition):
+          1. Yield a pending LEAF node (deepest available work unit).
+          2. If no pending leaves exist, yield an INTERNAL node whose
+             ALL children have already completed (not pending/running).
+          3. Return when nothing is left.
+
+        Because the execution engine may add new children between yields
+        (iterative deepening), this generator re-scans the tree on every
+        iteration via _iter_bfs() rather than pre-computing the order.
+
+        Yields:
+            :class:`TaskNode` objects in execution order.
+        """
+        while True:
+            # Find next pending leaf (DFS snapshot every scan)
+            for node in self._iter_dfs():
+                if node.is_leaf() and node.status == "pending":
+                    yield node
+                    break
+            else:
+                # No pending leaves — find internal with all children done
+                for node in self._iter_dfs():
+                    if (
+                        not node.is_leaf()
+                        and node.status == "pending"
+                        and all(
+                            c.status not in ("pending", "running")
+                            for c in node.children
+                        )
+                    ):
+                        yield node
+                        break
+                else:
+                    return  # nothing left
+
+    # ------------------------------------------------------------------
     # Serialisation
     # ------------------------------------------------------------------
 

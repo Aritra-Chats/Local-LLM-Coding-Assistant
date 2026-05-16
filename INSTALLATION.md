@@ -42,7 +42,7 @@ python --version
 
 ```bash
 # 1. Clone
-git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
+git clone https://github.com/Aritra-Chats/Local-LLM-Coding-Assistant.git
 cd Local-LLM-Coding-Assistant
 
 # 2. Add the Sentinel folder to your PATH
@@ -71,7 +71,7 @@ On first launch Sentinel will automatically:
 
 ```powershell
 # Clone
-git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
+git clone https://github.com/Aritra-Chats/Local-LLM-Coding-Assistant.git
 cd Local-LLM-Coding-Assistant
 
 # Add the folder to PATH, then open a new PowerShell window
@@ -88,7 +88,7 @@ python main.py
 ## 4. Linux / macOS Quick Start
 
 ```bash
-git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
+git clone https://github.com/Aritra-Chats/Local-LLM-Coding-Assistant.git
 cd Local-LLM-Coding-Assistant
 
 sentinel
@@ -226,32 +226,6 @@ Any Ollama-compatible model works. Well-tested alternatives:
 | Code generation | `deepseek-coder:6.7b`, `qwen2.5-coder:7b`, `starcoder2:7b` |
 | Reasoning | `llama3:8b`, `phi3:medium`, `gemma2:9b` |
 | Large context | `llama3:70b` (requires ≥ 40 GB RAM or large GPU) |
-
-### Online mode and cloud model discovery
-
-When using `--online`, Sentinel can discover and use models from cloud providers:
-
-```bash
-sentinel --online --hw-mode standard
-```
-
-In this mode, Sentinel uses the `online_model_discovery` subsystem to:
-- Query available cloud models (OpenAI, Anthropic, local providers)
-- Automatically select the best model for each task
-- Fall back to local models if cloud APIs are unavailable
-
-The online mode is useful when:
-- You have API credentials configured
-- You want higher-quality reasoning for complex tasks
-- Your local hardware is limited
-
-To check available cloud models:
-
-```
-sentinel › /models
-```
-
-This lists both local Ollama models and discovered cloud models (if in online mode).
 
 ---
 

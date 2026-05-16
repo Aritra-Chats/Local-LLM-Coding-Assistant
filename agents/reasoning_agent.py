@@ -27,6 +27,7 @@ class ReasoningAgent(BaseAgent):
     name = "reasoning"
 
     def __init__(self, ollama_client: Optional[Any] = None, model: str = "") -> None:
+        super().__init__()
         self._ollama = ollama_client
         self._model = model
 

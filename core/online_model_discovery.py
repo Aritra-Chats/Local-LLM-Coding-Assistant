@@ -70,6 +70,20 @@ _DOMAIN_KEYWORDS: Dict[str, List[str]] = {
     "system":           ["system", "os", "kernel", "infra"],
 }
 
+# ---------------------------------------------------------------------------
+# Domains that map to the "coding" agent (for parameter conditioning)
+# ---------------------------------------------------------------------------
+
+_CODING_AGENT_DOMAINS: frozenset = frozenset({
+    "coding_frontend",
+    "coding_backend",
+    "coding_general",
+    "data_science",
+    "creative",
+    "other",  # fallback for unknown domains typically goes to coding
+    "root",   # project root initialization typically goes to coding
+})
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,6 +134,56 @@ def _complexity_size_score(param_b: float, complexity: str) -> float:
     else:
         # Medium: gentle linear reward
         return min(param_b / 100.0 * 2.0, 2.0)
+
+
+def _extract_param_count_from_model(model: Dict[str, Any], tag: str) -> float:
+    """Extract parameter count in billions from a model dict.
+
+    Tries multiple sources: details metadata, model tag string, and fallback.
+
+    Args:
+        model: Model dict from cloud API response.
+        tag:   Model tag/name string.
+
+    Returns:
+        Parameter count in billions, or 0.0 if cannot be determined.
+    """
+    # Try structured details field first
+    details = model.get("details", {}) or {}
+    size_str = details.get("parameter_size") or details.get("parameters") or ""
+    if size_str:
+        return _parse_param_billions(str(size_str))
+
+    # Try extracting from tag string
+    clean = tag.replace(":cloud", "").replace("-cloud", "").upper()
+    # MoE pattern: 8x7b
+    moe = re.search(r"(\d+)X(\d+(?:\.\d+)?)B", clean)
+    if moe:
+        return float(moe.group(1)) * float(moe.group(2))
+    # Plain pattern: 31b, 7b, 70b
+    plain = re.search(r"(\d+(?:\.\d+)?)B", clean)
+    if plain:
+        return float(plain.group(1))
+
+    return 0.0
+
+
+def _should_exclude_model_for_coding(model_tag: str, model: Dict[str, Any]) -> bool:
+    """Check if a model should be excluded from coding tasks due to size.
+
+    Models with > 50B parameters are reserved for reasoning tasks.
+    Coding tasks benefit from smaller, faster models.
+
+    Args:
+        model_tag: The model identifier string.
+        model:     The model dict from cloud API.
+
+    Returns:
+        True if the model should be excluded for coding tasks, False otherwise.
+    """
+    param_count = _extract_param_count_from_model(model, model_tag)
+    # Exclude models with more than 50B parameters for coding
+    return param_count > 50.0
 
 
 class OnlineModelDiscoveryEngine:
@@ -182,6 +246,49 @@ class OnlineModelDiscoveryEngine:
             if tag:
                 tags.append(tag)
         return tags
+
+    def _is_coding_task(self, domain: str) -> bool:
+        """Check if the domain maps to a coding agent task.
+
+        Args:
+            domain: The task's routing_domain or domain value.
+
+        Returns:
+            True if the task will be assigned to a coding agent, False otherwise.
+        """
+        return domain in _CODING_AGENT_DOMAINS
+
+    def _filter_models_for_task(self, available_tags: List[str], domain: str) -> List[str]:
+        """Filter available models based on task type and model constraints.
+
+        In online mode, very large models (>50B parameters) should not be used
+        for coding tasks, as they are expensive and slower. Instead, they are
+        reserved for reasoning tasks where their extra capacity is beneficial.
+
+        Args:
+            available_tags: List of available model tags.
+            domain:         The task's routing_domain.
+
+        Returns:
+            Filtered list of model tags, excluding those that violate constraints.
+        """
+        # If this is a coding task, exclude models with >50B parameters
+        if not self._is_coding_task(domain):
+            return available_tags
+
+        # Build tag-to-model lookup
+        models_by_tag = {m.get("name") or m.get("id") or m.get("model", ""): m
+                         for m in self._get_cloud_models()}
+
+        filtered = []
+        for tag in available_tags:
+            model = models_by_tag.get(tag, {})
+            if not _should_exclude_model_for_coding(tag, model):
+                filtered.append(tag)
+
+        # If all models were filtered out (edge case), return the original list
+        # to allow fallback chain to work
+        return filtered if filtered else available_tags
 
     # ------------------------------------------------------------------
     # Web-search scoring
@@ -254,6 +361,9 @@ class OnlineModelDiscoveryEngine:
         1. ``metadata_score`` — parameter size × complexity fit + name keywords
         2. ``search_score``   — web benchmark mention frequency + position rank
 
+        In online mode for coding tasks, models with >50B parameters are excluded
+        and reserved for reasoning agents.
+
         No model names or scores are hardcoded here; everything is inferred
         from what the Ollama Cloud API returns and what current benchmarks say.
         """
@@ -265,11 +375,12 @@ class OnlineModelDiscoveryEngine:
         if not available_tags:
             return None
 
-        # ── Layer 1: Metadata scoring ──────────────────────────────────────
-        # Build a lookup: tag → model dict for parameter-size extraction
+        # ── Apply task-specific model filtering ─────────────────────────────
+        # For coding tasks, exclude very large models (>50B parameters)
+        available_tags = self._filter_models_for_task(available_tags, domain)
         tag_to_meta: Dict[str, Dict] = {}
         for m in available_models:
-            tag = m.get("name", m.get("model", ""))
+            tag = m.get("name") or m.get("id") or m.get("model", "")
             if tag:
                 tag_to_meta[tag] = m
 
@@ -345,6 +456,113 @@ class OnlineModelDiscoveryEngine:
             f"runtime-scored for {domain}/{complexity} "
             f"(meta={meta_s:.2f} web={search_s:.2f} total={best_score:.2f})"
         )
+
+        # Note in reason if large models were filtered for coding tasks
+        if self._is_coding_task(domain):
+            reason += " [large models excluded for coding]"
+
+        return best_base, reason
+
+    # ------------------------------------------------------------------
+    # Decomposition model selector (≤250B cap)
+    # ------------------------------------------------------------------
+
+    def select_decomposition_model(
+        self,
+        domain: str,
+        complexity: str,
+    ) -> Optional[Tuple[str, str]]:
+        """Select the best cloud model for task decomposition.
+
+        Uses the same two-layer scoring as _select_ollama_cloud() but:
+        1. Treats the task as a reasoning task regardless of domain
+           (decomposition is always a structured reasoning operation).
+        2. Hard-filters any model whose parameter count exceeds 250B.
+           If all models exceed 250B, fall back to the full unfiltered list
+           so we always have a result.
+        3. Adjusts _complexity_size_score to use "medium" cap for the size
+           dimension (we don't want the very largest models, just capable ones).
+
+        Returns (model_base_tag, reason) or None if no cloud models available.
+        """
+        available_models = self._get_cloud_models()
+        if not available_models:
+            return None
+
+        # Build tag list from available models
+        all_candidates = []
+        for m in available_models:
+            tag = m.get("name") or m.get("id") or m.get("model", "")
+            if tag:
+                all_candidates.append((tag, m))
+
+        if not all_candidates:
+            return None
+
+        # Filter to models ≤250B; fall back to full list if all exceed cap
+        decomp_candidates = [
+            (tag, m) for tag, m in all_candidates
+            if _extract_param_count_from_model(m, tag) <= 250.0
+        ]
+        if not decomp_candidates:
+            decomp_candidates = all_candidates
+
+        # Layer 1: metadata scoring — always treat as "reasoning" for decomposition
+        metadata_scores: Dict[str, float] = {}
+        for tag, meta in decomp_candidates:
+            details = meta.get("details", {}) or {}
+
+            param_b = _extract_param_count_from_model(meta, tag)
+
+            # Family keywords from API metadata
+            family = (
+                details.get("family", "")
+                + " "
+                + details.get("format", "")
+            ).lower()
+
+            score = 0.0
+            # Use "medium" cap for size dimension — capable but not extreme
+            score += _complexity_size_score(param_b, "medium")
+            # Reasoning keyword score (decomposition is always reasoning)
+            score += _name_keyword_score(tag, "reasoning")
+            # Family keyword bonus for reasoning domain
+            for kw in _DOMAIN_KEYWORDS.get("reasoning", []):
+                if kw in family:
+                    score += 0.5
+
+            metadata_scores[tag] = score
+
+        # Layer 2: web-search scoring — use actual subtask complexity for relevance
+        web_scores = self._web_search_scores("reasoning", complexity)
+
+        # Combine scores
+        combined: Dict[str, float] = {}
+        for tag, _ in decomp_candidates:
+            base_tag = tag.replace(":cloud", "").replace("-cloud", "")
+            combined[tag] = (
+                metadata_scores.get(tag, 0.0)
+                + web_scores.get(base_tag, 0.0)
+            )
+
+        if not combined:
+            return None
+
+        best_tag = max(combined, key=combined.__getitem__)
+        best_score = combined[best_tag]
+        best_base = best_tag.replace(":cloud", "").replace("-cloud", "")
+
+        meta_s = metadata_scores.get(best_tag, 0.0)
+        search_s = web_scores.get(best_base, 0.0)
+        best_meta = dict(decomp_candidates)[best_tag] if best_tag in dict(decomp_candidates) else {}
+        param_b_best = _extract_param_count_from_model(best_meta, best_tag)
+
+        reason = (
+            f"decomposition model for {domain}/{complexity} "
+            f"(params={param_b_best:.0f}B meta={meta_s:.2f} "
+            f"web={search_s:.2f} total={best_score:.2f} ≤250B cap applied)"
+        )
+
         return best_base, reason
 
     # ------------------------------------------------------------------
@@ -385,6 +603,17 @@ class OnlineModelDiscoveryEngine:
                 "model":    "<tag or model id>",
                 "reason":   "<justification string>",
             }
+
+        Model conditioning for coding tasks
+        ------------------------------------
+        In online mode, very large models (>50B parameters) are excluded from
+        coding tasks and reserved for reasoning agents. This is because:
+        - Large models are slower and more expensive for routine coding tasks
+        - Smaller, specialized models are often more efficient for code generation
+        - Reasoning tasks benefit from the extra capacity for complex analysis
+
+        The filtering is applied during cloud model selection; if no suitable
+        models remain after filtering, the original list is used as fallback.
 
         Args:
             sub_task: A sub-task dict (should already have ``routing_domain``).
@@ -436,3 +665,40 @@ class OnlineModelDiscoveryEngine:
             "reason":   "degraded — no model could be selected",
         }
         return sub_task
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience wrapper
+# ---------------------------------------------------------------------------
+
+
+def pick_decomposition_model(
+    cloud_models: List[Dict],
+    domain: str = "reasoning",
+    complexity: str = "medium",
+    tool_registry: Optional[Any] = None,
+    ttl_seconds: int = 1800,
+) -> str:
+    """Convenience wrapper: builds a temporary engine and calls
+    select_decomposition_model(). Returns the model tag string, or ''.
+
+    Args:
+        cloud_models:  List of model dicts returned by OllamaCloudClient.list_models().
+        domain:        Domain hint for web-search scoring (default: "reasoning").
+        complexity:    Complexity level for scoring (default: "medium").
+        tool_registry: Optional tool registry for web-search scoring.
+        ttl_seconds:   Cache TTL in seconds (default: 1800).
+
+    Returns:
+        The model base tag string, or '' if no model could be selected.
+    """
+    engine = OnlineModelDiscoveryEngine(
+        ollama_cloud_client=None,
+        tool_registry=tool_registry,
+        ttl_seconds=ttl_seconds,
+    )
+    # Manually populate the cache so _get_cloud_models() returns our list
+    engine._cached_models = cloud_models
+    engine._cache_ts = time.monotonic()
+    result = engine.select_decomposition_model(domain, complexity)
+    return result[0] if result else ""

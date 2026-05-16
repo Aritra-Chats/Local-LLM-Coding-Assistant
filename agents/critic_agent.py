@@ -148,6 +148,7 @@ class CriticAgent(BaseAgent):
         model: str = "",
         max_revisions: int = 1,
     ) -> None:
+        super().__init__()
         self._ollama = ollama_client
         self._model = model
         self.max_revisions = max_revisions

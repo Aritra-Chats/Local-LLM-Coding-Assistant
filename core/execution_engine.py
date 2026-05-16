@@ -144,17 +144,24 @@ is started and stopped automatically when ``show_progress=True``.
 
 
 import time
+import threading
 import traceback
 import uuid
+import os
+import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from agents.agent_action import AgentAction
 
 
 # ---------------------------------------------------------------------------
-# Progress event type
+# Abort exception (raised when supervisor signals abort)
 # ---------------------------------------------------------------------------
+
+class AbortException(Exception):
+    """Raised by the execution loop when supervisor requests an abort."""
+    pass
 
 # Valid event names emitted by the engine.
 PROGRESS_EVENTS = (
@@ -370,6 +377,7 @@ class ConcreteExecutionEngine(ExecutionEngine):
         self.on_progress = on_progress
         self._console = console
         self._require_approval = require_approval
+        self._auto_approve_session: bool = False  # Auto-approve all requests if True
         self._context_builder = context_builder
         # Learning loop: tracker collects metrics; router reads them for routing
         self._tracker: Optional[Any] = performance_tracker
@@ -384,14 +392,302 @@ class ConcreteExecutionEngine(ExecutionEngine):
         self._start_time: float = 0.0
         self._progress_tracker: Optional[Any] = None  # Live UI progress tracker
 
+        # Architecture state — set when project_initializer runs; used to route
+        # write_file calls into frontend/ or backend/ for fullstack projects.
+        self._project_architecture: str = "single"   # "single" | "frontend" | "backend" | "fullstack"
+        self._project_dirs: Dict[str, str] = {}       # keys: "frontend", "backend"
+
         # FileChangeMap — one per pipeline run, tracks all write_file outcomes
         from core.file_change_map import FileChangeMap
         self.file_change_map = FileChangeMap()
         self._session_id: str = ""  # set by run_pipeline from context if available
 
+        # ── Supervisor integration ─────────────────────────────────────────────
+        import queue as _queue
+        self._supervisor_agent: Optional[Any] = None
+        self._supervisor_bus: Optional[Any] = None        # SupervisorBus
+        self._supervisor_loop: Optional[Any] = None       # AsyncSupervisorLoop
+        self._pause_event: threading.Event = threading.Event()
+        self._pause_event.set()    # initially un-paused (set = allowed to run)
+        self._fix_queue: _queue.Queue = _queue.Queue()   # FixProposal objects
+        self._abort_flag: bool = False
+        self._abort_reason: str = ""
+        self._shell_command_history: List[str] = []
+        self._known_files: List[str] = []
+
     # ------------------------------------------------------------------
-    # Primary public API — typed Pipeline input
+    # Supervisor integration API
     # ------------------------------------------------------------------
+
+    def attach_supervisor(
+        self,
+        supervisor: Any,
+        tracker: Optional[Any] = None,
+    ) -> None:
+        """Create the :class:`~core.supervisor_bus.SupervisorBus` and start the
+        :class:`~core.async_supervisor.AsyncSupervisorLoop`.
+
+        Call this after engine construction, before ``run_pipeline()``.
+
+        Args:
+            supervisor: A :class:`~agents.supervisor.ConcreteSupervisorAgent`.
+            tracker: Optional :class:`~cli.progress_tracker.ConcreteProgressTracker`.
+        """
+        from core.supervisor_bus import SupervisorBus
+        self._supervisor_agent = supervisor
+        self._supervisor_bus = SupervisorBus()
+        self._supervisor_loop = supervisor.start_async_monitoring(
+            self._supervisor_bus, self, tracker
+        )
+
+    def pause(self, reason: str = "") -> None:
+        """Block the execution loop until :meth:`resume` is called.
+
+        Called by the supervisor thread when it needs to inject fix actions
+        before the engine attempts the next retry.
+        """
+        self._pause_event.clear()
+
+    def resume(self) -> None:
+        """Unblock the execution loop after fix actions have been dispatched."""
+        self._pause_event.set()
+
+    def inject_fix_and_retry(self, step_id: str, fix_proposal: Any) -> None:
+        """Dispatch supervisor fix actions and signal the engine to retry.
+
+        This is called from the supervisor daemon thread.  It puts the
+        proposal on :attr:`_fix_queue` (thread-safe) and resumes the engine.
+
+        Args:
+            step_id: UUID of the step that failed.
+            fix_proposal: A :class:`~core.supervisor_bus.FixProposal`.
+        """
+        self._fix_queue.put(fix_proposal)
+        self.resume()
+
+    def abort(self, reason: str) -> None:
+        """Signal the engine to abort the current pipeline run.
+
+        Sets :attr:`_abort_flag` which the execution loop checks at the top
+        of each iteration.  Also resumes a paused engine so it can see the flag.
+
+        Args:
+            reason: Human-readable abort message shown to the user.
+        """
+        self._abort_reason = reason
+        self._abort_flag = True
+        self.resume()  # unblock any waiting pause
+
+    def _shell_history_context(self) -> List[str]:
+        """Return the recent shell command history for supervisor review."""
+        return list(self._shell_command_history[-25:])
+
+    def review_shell_command(self, tool_name: str, params: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Ask the supervisor model whether a shell-like tool call should run.
+
+        The supervisor can return a runtime policy dict with keys such as
+        ``decision`` (``run``, ``skip``, ``bounded_run``), ``timeout_seconds``,
+        ``display_label``, and ``reason``.
+        """
+        reviewer = self._supervisor_agent
+        review_fn = getattr(reviewer, "review_shell_tool_call", None) if reviewer is not None else None
+        if not callable(review_fn):
+            return {}
+
+        review_context = dict(context or {})
+        review_context.setdefault("shell_command_history", self._shell_history_context())
+        try:
+            review = review_fn(tool_name=tool_name, params=dict(params), context=review_context)
+            return review if isinstance(review, dict) else {}
+        except Exception:
+            return {}
+
+    def _record_shell_history(self, tool_name: str, params: Dict[str, Any], result: Optional[Dict[str, Any]] = None) -> None:
+        """Store shell commands so the supervisor can avoid rerunning them."""
+        commands: List[str] = []
+
+        def _should_record(command: str) -> bool:
+            first = (command.strip().split(maxsplit=1)[0] if command.strip() else "").lower().strip("\"'")
+            if first in {"mkdir", "md", "rmdir", "rd", "write", "read", "modify"}:
+                return False
+            return True
+
+        if tool_name == "run_shell":
+            command = str(params.get("command", "")).strip()
+            if command and _should_record(command):
+                commands.append(command)
+        elif tool_name == "project_initializer":
+            output = result.get("output") if isinstance(result, dict) else {}
+            if isinstance(output, dict):
+                steps = output.get("steps") or []
+                for step in steps:
+                    if isinstance(step, dict):
+                        command = str(step.get("command", "")).strip()
+                        if command and _should_record(command):
+                            commands.append(command)
+
+        for command in commands:
+            if command not in self._shell_command_history:
+                self._shell_command_history.append(command)
+
+    def _refresh_known_files(self, project_root: str) -> None:
+        """Refresh the in-memory known-files list from disk (bounded scan)."""
+        if not project_root or not os.path.isdir(project_root):
+            self._known_files = []
+            return
+
+        max_files = 800
+        skip_dirs = {
+            "node_modules", "venv", ".venv", ".git", "__pycache__",
+            ".next", "dist", "build", ".pytest_cache", ".mypy_cache",
+        }
+        known: List[str] = []
+        for root, dirs, files in os.walk(project_root):
+            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+            for fname in files:
+                if fname.startswith("."):
+                    continue
+                abs_path = os.path.join(root, fname)
+                try:
+                    rel_path = os.path.relpath(abs_path, project_root).replace("\\", "/")
+                except ValueError:
+                    rel_path = abs_path.replace("\\", "/")
+                known.append(rel_path)
+                if len(known) >= max_files:
+                    self._known_files = sorted(set(known))
+                    return
+        self._known_files = sorted(set(known))
+
+    def _detect_stack_from_known_files(self, project_root: str) -> Dict[str, str]:
+        """Infer a lightweight stack snapshot from marker files."""
+        stack: Dict[str, str] = {}
+
+        def _exists(rel_path: str) -> bool:
+            return os.path.exists(os.path.join(project_root, rel_path))
+
+        if _exists("package.json"):
+            stack["runtime"] = "Node.js"
+        if _exists("requirements.txt") or _exists("pyproject.toml"):
+            stack["runtime"] = "Python"
+        if _exists("Dockerfile") or _exists("docker-compose.yml") or _exists("docker-compose.yaml"):
+            stack["container"] = "Docker"
+        if _exists("vite.config.js") or _exists("vite.config.ts"):
+            stack["build"] = "Vite"
+        if _exists("next.config.js") or _exists("next.config.ts"):
+            stack["frontend"] = "Next.js"
+        if _exists("angular.json"):
+            stack["frontend"] = "Angular"
+
+        package_json = os.path.join(project_root, "package.json")
+        if os.path.isfile(package_json):
+            try:
+                with open(package_json, "r", encoding="utf-8", errors="ignore") as fh:
+                    pkg = fh.read().lower()
+                if '"react"' in pkg:
+                    stack["frontend"] = "React"
+                elif '"vue"' in pkg:
+                    stack["frontend"] = "Vue"
+                elif '"svelte"' in pkg:
+                    stack["frontend"] = "Svelte"
+                if '"express"' in pkg:
+                    stack["backend"] = "Express"
+                elif '"fastify"' in pkg:
+                    stack["backend"] = "Fastify"
+            except Exception:
+                pass
+
+        req_txt = os.path.join(project_root, "requirements.txt")
+        if os.path.isfile(req_txt):
+            try:
+                with open(req_txt, "r", encoding="utf-8", errors="ignore") as fh:
+                    req = fh.read().lower()
+                if "fastapi" in req:
+                    stack["backend"] = "FastAPI"
+                elif "django" in req:
+                    stack["backend"] = "Django"
+                elif "flask" in req:
+                    stack["backend"] = "Flask"
+            except Exception:
+                pass
+
+        return stack
+
+    def _workspace_snapshot(self, project_root: str) -> Dict[str, Any]:
+        """Build a compact, per-step codebase snapshot for all subagents."""
+        stack = self._detect_stack_from_known_files(project_root) if project_root else {}
+        recent_changes = [
+            {
+                "path": ev.logical_path,
+                "operation": ev.operation,
+                "agent": ev.agent,
+                "step_id": ev.step_id,
+            }
+            for ev in self.file_change_map.all_events()[-20:]
+        ]
+        return {
+            "project_root": project_root,
+            "known_files_count": len(self._known_files),
+            "known_files_preview": self._known_files[:120],
+            "stack": stack,
+            "recent_changes": recent_changes,
+            "summary": (
+                f"Known files: {len(self._known_files)} | "
+                + ("Stack: " + ", ".join(f"{k}={v}" for k, v in stack.items()) if stack else "Stack: unknown")
+            ),
+        }
+
+    def _looks_like_long_running_shell(self, command: str) -> bool:
+        """Return True for dev/watch/server shell commands that should be bounded."""
+        cmd = (command or "").strip().lower()
+        if not cmd:
+            return False
+        patterns = [
+            r"\bnpm\s+run\s+(dev|start|watch)\b",
+            r"\bpnpm\s+(dev|start|watch)\b",
+            r"\byarn\s+(dev|start|watch)\b",
+            r"\bnpx\s+vite\b",
+            r"\bnext\s+dev\b",
+            r"\bwebpack\b.*\b--watch\b",
+            r"\bnodemon\b",
+            r"\buvicorn\b.*\b--reload\b",
+            r"\bflask\s+run\b",
+            r"\bdjango-admin\s+runserver\b",
+            r"\bpython\s+.*manage\.py\s+runserver\b",
+        ]
+        return any(re.search(p, cmd) for p in patterns)
+
+    def _maybe_skip_project_initializer(self, params: Dict[str, Any], context: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+        """Detect already-initialized projects and skip duplicate scaffolding."""
+        if bool(params.get("force", False)):
+            return False, ""
+
+        project_root = ""
+        if context:
+            project_root = str(context.get("project_root", "") or "")
+        if not project_root or not os.path.isdir(project_root):
+            return False, ""
+
+        if not self._known_files:
+            self._refresh_known_files(project_root)
+
+        marker_files = {
+            "package.json", "requirements.txt", "pyproject.toml",
+            "manage.py", "Dockerfile", "vite.config.ts", "vite.config.js",
+            "next.config.js", "next.config.ts",
+        }
+        known_set = {p.replace("\\", "/").strip() for p in self._known_files}
+        marker_hit = any(m in known_set for m in marker_files)
+        code_like_count = sum(
+            1 for p in known_set
+            if p.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css"))
+        )
+
+        if marker_hit or code_like_count >= 3:
+            stack = self._detect_stack_from_known_files(project_root)
+            stack_hint = ", ".join(f"{k}={v}" for k, v in stack.items()) or "existing files"
+            return True, f"Project already appears initialized ({stack_hint}); skipping duplicate project_initializer."
+
+        return False, ""
 
     def run_pipeline(self, pipeline: Any) -> PipelineRunResult:
         """Execute a :class:`~execution.pipeline.Pipeline`.
@@ -434,6 +730,8 @@ class ConcreteExecutionEngine(ExecutionEngine):
         # Reset FileChangeMap for this pipeline run
         from core.file_change_map import FileChangeMap
         self.file_change_map = FileChangeMap()
+        self._shell_command_history = []
+        self._known_files = []
 
         result = PipelineRunResult(
             run_id=run_id,
@@ -595,6 +893,20 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 any_failed = any(r.status == "failed" for r in result.step_results)
                 result.status = "partial" if any_failed else "completed"
 
+        except AbortException as _ae:
+            result.status = "failed"
+            _abort_msg = str(_ae)
+            self._emit(ProgressEvent(
+                event="pipeline_failed",
+                message=f"Pipeline aborted by supervisor: {_abort_msg}",
+                data={"abort_reason": _abort_msg},
+            ))
+            # Print structured abort message to console
+            try:
+                import sys
+                print(f"\n[Sentinel] Pipeline aborted:\n{_abort_msg}", file=sys.stderr)
+            except Exception:
+                pass
         except Exception as exc:
             result.status = "failed"
             tb = traceback.format_exc()
@@ -613,6 +925,22 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 except Exception:
                     pass
             self._progress_tracker = None  # Clear reference
+
+        # ── Notify supervisor that the pipeline is done ────────────────────────
+        if self._supervisor_bus is not None:
+            try:
+                from core.supervisor_bus import BusEvent, BusEventType
+                self._supervisor_bus.emit(BusEvent(
+                    type=BusEventType.PIPELINE_DONE,
+                    step_id="", step_index=-1, step_name="pipeline",
+                ))
+            except Exception:
+                pass
+        if self._supervisor_loop is not None:
+            try:
+                self._supervisor_loop.stop()
+            except Exception:
+                pass
 
         self._emit(ProgressEvent(
             event="pipeline_complete",
@@ -714,7 +1042,25 @@ class ConcreteExecutionEngine(ExecutionEngine):
             "model":        step.get("model_hint", ""),
             "council":      step.get("council_agents", []),
             "project_root": step.get("project_root") or step.get("metadata", {}).get("project_root", ""),
+            "shell_command_history": self._shell_history_context(),
+            # Numeric pipeline index — used by _dispatch_actions to update the
+            # live progress label via update_step_action.  Without this,
+            # context.get("step_index") returns None, the int() cast on the
+            # UUID-shaped step_id raises ValueError (swallowed), and the label
+            # never updates from the static step name.
+            "step_index": step.get("index", 0),
+            # Architecture set by project_initializer — used by the coding agent
+            # to generate correctly prefixed write_file paths.
+            "project_architecture": self._project_architecture,
+            "project_dirs":         dict(self._project_dirs),
+            "known_files": list(self._known_files),
         }
+
+        project_root = base.get("project_root", "")
+        if project_root:
+            self._refresh_known_files(project_root)
+            base["known_files"] = list(self._known_files)
+            base["workspace_snapshot"] = self._workspace_snapshot(project_root)
 
         # Enrich with ConcreteContextBuilder output if available
         if self._context_builder is not None:
@@ -817,7 +1163,63 @@ class ConcreteExecutionEngine(ExecutionEngine):
         all_actions: List[AgentAction] = []
         all_tool_results: List[Dict[str, Any]] = []
 
+        # ── SDLC gate: entry contract check ───────────────────────────────────
+        try:
+            from core.step_contract import StepContract, ContractChecker
+            _contract = StepContract.from_dict(step.get("contract"))
+            if _contract:
+                _ctx_for_entry = {"project_root": "", "output_dir": ""}
+                try:
+                    _ctx_for_entry = self.build_context(step)
+                except Exception:
+                    pass
+                _entry_result = ContractChecker.check_entry(_contract, _ctx_for_entry)
+                if not _entry_result.passed and self._supervisor_bus is not None:
+                    from core.supervisor_bus import BusEvent, BusEventType
+                    self._supervisor_bus.emit(BusEvent(
+                        type=BusEventType.STEP_ENTRY_FAILED,
+                        step_id=step_id,
+                        step_index=idx,
+                        step_name=name,
+                        error=f"Entry check failed: {_entry_result.details}",
+                        context=_ctx_for_entry,
+                        extra={"failed_items": _entry_result.failed_items,
+                               "agent": step.get("agent", "")},
+                    ))
+                    self.pause("Waiting for supervisor to fix entry requirements")
+                    self._pause_event.wait()
+                    # After supervisor fixes, check abort flag
+                    if self._abort_flag:
+                        raise AbortException(self._abort_reason)
+        except AbortException:
+            raise
+        except Exception:
+            pass  # Never let contract checks break execution
+
         while attempt <= max_retries:
+            # ── Pause / abort check at the top of every iteration ─────────────
+            self._pause_event.wait()  # blocks if supervisor called pause()
+            if self._abort_flag:
+                raise AbortException(self._abort_reason)
+
+            # ── Drain any pending fix proposals from the supervisor ────────────
+            _pending_fixes = []
+            while not self._fix_queue.empty():
+                try:
+                    _pending_fixes.append(self._fix_queue.get_nowait())
+                except Exception:
+                    break
+            for _fix in _pending_fixes:
+                try:
+                    _fix_actions = getattr(_fix, "fix_actions", []) or []
+                    _fix_results = self._dispatch_actions(_fix_actions, {
+                        "step_index": idx, "step_name": name,
+                        "project_root": "",
+                    })
+                    all_tool_results.extend(_fix_results)
+                except Exception:
+                    pass
+
             try:
                 context = self.build_context(step)
                 model = self.select_model(step, context)
@@ -839,7 +1241,17 @@ class ConcreteExecutionEngine(ExecutionEngine):
                     _online_provider = _online_sel.get("provider", "ollama_local")
                     _online_model_tag = _online_sel.get("model", "")
                     if _online_provider != "ollama_local" and _online_model_tag:
-                        step["_selected_model"] = _online_model_tag
+                        # Probe the full fallback chain before stamping
+                        # _selected_model.  _resolve_with_fallback returns the
+                        # effective model tag for whichever tier succeeded,
+                        # preventing a cloud model name from being sent to a
+                        # local endpoint (which always fails with HTTP 404).
+                        _probe_client, _effective_tag = self._resolve_with_fallback(
+                            _online_provider, _online_model_tag
+                        )
+                        if _probe_client is not None:
+                            step["_selected_model"] = _effective_tag
+                        # else: retain the local model from select_model()
 
                 # Council or solo dispatch.
                 if council and len(council) > 1:
@@ -899,6 +1311,47 @@ class ConcreteExecutionEngine(ExecutionEngine):
                     except Exception:
                         pass
 
+                # ── SDLC gate: exit contract check ────────────────────────────
+                try:
+                    from core.step_contract import StepContract, ContractChecker
+                    _exit_contract = StepContract.from_dict(step.get("contract"))
+                    if _exit_contract and self._supervisor_bus is not None:
+                        _proj_root = context.get("project_root", "") if context else ""
+                        _known = context.get("known_files", []) if context else []
+                        _exit_result = ContractChecker.check_exit(
+                            _exit_contract, _proj_root, _known
+                        )
+                        if not _exit_result.passed:
+                            from core.supervisor_bus import BusEvent, BusEventType
+                            self._supervisor_bus.emit(BusEvent(
+                                type=BusEventType.STEP_EXIT_FAILED,
+                                step_id=step_id,
+                                step_index=idx,
+                                step_name=name,
+                                error=f"Exit check failed: {_exit_result.details}",
+                                context=context or {},
+                                attempt=attempt,
+                                extra={"failed_items": _exit_result.failed_items},
+                            ))
+                            self.pause("Waiting for supervisor to fix exit criteria")
+                            self._pause_event.wait()
+                            if self._abort_flag:
+                                raise AbortException(self._abort_reason)
+                            # Drain supervisor fix actions
+                            while not self._fix_queue.empty():
+                                try:
+                                    _xfix = self._fix_queue.get_nowait()
+                                    _xacts = getattr(_xfix, "fix_actions", []) or []
+                                    self._dispatch_actions(_xacts, context or {})
+                                except Exception:
+                                    break
+                            attempt += 1
+                            continue
+                except AbortException:
+                    raise
+                except Exception:
+                    pass  # Never break execution for contract checks
+
                 return StepResult(
                     step_id=step_id,
                     step_name=name,
@@ -910,6 +1363,8 @@ class ConcreteExecutionEngine(ExecutionEngine):
                     elapsed_ms=elapsed_ms,
                 )
 
+            except AbortException:
+                raise  # propagate abort without retrying
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
                 # Record model failure in learning tracker
@@ -1005,6 +1460,80 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 return None
         return None
 
+    def _resolve_with_fallback(
+        self, provider: str, model_tag: str
+    ) -> "tuple[Optional[Any], str]":
+        """Resolve an inference client with automatic provider fallback.
+
+        Implements the chain: **ollama_cloud → external provider → local**.
+
+        If the requested provider cannot be constructed (missing API key,
+        import failure, etc.) the method tries the next tier in the chain
+        rather than immediately returning ``None``.  This ensures agents
+        always get a working client when *any* online provider is configured,
+        and only degrade to local Ollama when none is available.
+
+        Args:
+            provider:  The originally selected provider string.
+            model_tag: The model tag associated with that provider.
+
+        Returns:
+            A ``(client, effective_model_tag)`` tuple.  ``client`` is ``None``
+            when no online provider is available (caller should use local
+            Ollama).  ``effective_model_tag`` may differ from *model_tag* when
+            fallback to a different provider occurs — callers must use this
+            value to stamp ``step["_selected_model"]`` so agents never send a
+            cloud model name to a non-cloud endpoint.
+        """
+        import os
+
+        # Local — no client needed; caller uses its default Ollama instance
+        if provider == "ollama_local" or not provider:
+            return None, model_tag
+
+        # ── Tier 1: Ollama Cloud ─────────────────────────────────────────────
+        if provider == "ollama_cloud":
+            try:
+                from models.ollama_cloud_client import OllamaCloudClient
+                client = OllamaCloudClient(
+                    api_key=os.environ.get("OLLAMA_API_KEY", "")
+                )
+                return client, model_tag
+            except Exception:
+                pass  # missing API key or import failure → fall to tier 2
+
+        # ── Tier 2: External provider ────────────────────────────────────────
+        # When the original provider was "ollama_cloud" (and failed), try all
+        # external providers in affinity order.
+        # When the original provider IS an external provider, try it first
+        # then fall through to the others on failure.
+        try:
+            from models.external_api_client import ExternalAPIClient
+            if provider in ("anthropic", "openai", "google"):
+                ext_order = [provider] + [
+                    p for p in ("anthropic", "google", "openai") if p != provider
+                ]
+            else:
+                ext_order = ["anthropic", "google", "openai"]
+
+            for ext_provider in ext_order:
+                try:
+                    ext_client = ExternalAPIClient(ext_provider)
+                    if ext_client.is_available():
+                        meta = ExternalAPIClient.PROVIDERS[ext_provider]
+                        ext_model = (
+                            os.environ.get(meta["model_env"], "")
+                            or meta["default"]
+                        )
+                        return ext_client, ext_model
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # ── Tier 3: Local Ollama (degraded) ─────────────────────────────────
+        return None, model_tag
+
     # ------------------------------------------------------------------
 
     def _run_solo(
@@ -1030,17 +1559,67 @@ class ConcreteExecutionEngine(ExecutionEngine):
             raise RuntimeError(f"No agent registered for '{agent_name}'.")
 
         # ── Online mode: inject provider-specific inference client ─────
+        # Uses _resolve_with_fallback so the chain ollama_cloud → external
+        # → local is respected at runtime, not just at discovery time.
         selected = step.get("selected_model") or step.get("metadata", {}).get("selected_model")
         if selected:
             try:
-                import os
-                provider = selected.get("provider", "ollama_local")
+                provider  = selected.get("provider", "ollama_local")
                 model_tag = selected.get("model", "")
-                client_obj = self._resolve_inference_client(provider, model_tag)
+                client_obj, effective_tag = self._resolve_with_fallback(
+                    provider, model_tag
+                )
                 if client_obj is not None and hasattr(agent, "use_client"):
                     agent.use_client(client_obj)
+                    # Keep _selected_model in sync with the actual client used
+                    # in case fallback chose a different provider/model.
+                    if effective_tag and effective_tag != model_tag:
+                        step["_selected_model"] = effective_tag
             except Exception:
                 pass  # Never break execution for client injection errors
+
+        # Update the live label to show the agent is reasoning before the LLM
+        # call returns.  Without this the step sits on its static pipeline name
+        # (e.g. "initialize project scaffold") for the entire inference period
+        # — often 10–30 s — with no visible activity.
+        # Label format:  "<Verb>: <step description>"
+        # e.g.  "Writing code: initialize project scaffold"
+        #        "Planning: analyse requirements"
+        #        "Debugging: fix failing tests"
+        _solo_step_idx: Optional[int] = None
+        try:
+            _solo_step_idx = int(step.get("index", -1))
+        except (TypeError, ValueError):
+            pass
+        if self._progress_tracker is not None and _solo_step_idx is not None and _solo_step_idx >= 0:
+            try:
+                _AGENT_VERBS: Dict[str, str] = {
+                    "coding":     "Writing code",
+                    "coding_frontend": "Writing frontend code",
+                    "coding_backend":  "Writing backend code",
+                    "coding_general":  "Writing code",
+                    "planner":    "Planning",
+                    "planning":   "Planning",
+                    "debugging":  "Debugging",
+                    "devops":     "Configuring",
+                    "research":   "Researching",
+                    "reasoning":  "Analysing",
+                    "system":     "Running system task",
+                    "critic":     "Reviewing",
+                    "supervisor": "Coordinating",
+                }
+                _agent_name = step.get("agent", "").lower().strip()
+                _verb = _AGENT_VERBS.get(_agent_name, "Working on")
+                # Use description preferentially; fall back to name
+                _step_desc = (step.get("description") or step.get("name") or "").strip()
+                _thinking_label = (
+                    f"{_verb}: {_step_desc}" if _step_desc else f"{_verb}\u2026"
+                )
+                self._progress_tracker.update_step_action(
+                    _solo_step_idx, _thinking_label
+                )
+            except Exception:
+                pass
 
         output = agent.run(step, context)
         actions: List[AgentAction] = output.get("actions", [])
@@ -1401,6 +1980,190 @@ class ConcreteExecutionEngine(ExecutionEngine):
 
         return primary_output, all_actions, all_tool_results
 
+    # ------------------------------------------------------------------
+    # Fullstack write-file routing helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _classify_file_path(path: str) -> str:
+        """Classify *path* as ``'frontend'`` or ``'backend'``.
+
+        Uses file extension, directory segments, and known config filenames
+        as scoring signals.  Returns ``'frontend'`` as the safe default for
+        ambiguous files (e.g. ``package.json``, ``README.md``).
+        """
+        from pathlib import Path as _Path
+        p     = _Path(path.replace("\\", "/"))
+        ext   = p.suffix.lower()
+        parts = {part.lower() for part in p.parts}
+        name  = p.name.lower()
+
+        # ── Strong backend signals ────────────────────────────────────
+        _be_exts = {".py", ".go", ".rs", ".rb", ".php", ".java", ".kt", ".cs"}
+        _be_segs = {
+            "routes", "controllers", "models", "middleware", "migrations",
+            "api", "db", "database", "services", "repositories", "schemas",
+            "daemon", "worker", "queue", "jobs", "tasks",
+        }
+        _be_names = {
+            "manage.py", "requirements.txt", "pipfile", "pipfile.lock",
+            "setup.py", "setup.cfg", "pyproject.toml",
+            "server.js", "server.ts", "server.mjs",
+            "app.py", "main.py", "wsgi.py", "asgi.py",
+            "docker-compose.yml", "docker-compose.yaml",
+            "dockerfile",
+            ".env", ".env.example", ".env.production",
+        }
+        if ext in _be_exts or parts & _be_segs or name in _be_names:
+            return "backend"
+
+        # ── Strong frontend signals ───────────────────────────────────
+        _fe_exts = {
+            ".jsx", ".tsx", ".vue", ".svelte", ".css", ".scss", ".sass",
+            ".less", ".html", ".svg", ".styl",
+        }
+        _fe_segs = {
+            "components", "pages", "views", "styles", "assets", "public",
+            "ui", "layouts", "hooks", "context", "store", "redux", "atoms",
+            "molecules", "organisms", "templates",
+        }
+        _fe_names = {
+            "index.html", "app.jsx", "app.tsx", "app.vue", "app.svelte",
+            "main.jsx", "main.tsx", "main.vue",
+            "vite.config.js", "vite.config.ts",
+            "webpack.config.js", "webpack.config.ts",
+            "angular.json", "tailwind.config.js", "tailwind.config.ts",
+            "postcss.config.js", ".babelrc", ".eslintrc.js", ".eslintrc.json",
+            "nuxt.config.js", "nuxt.config.ts",
+            "next.config.js", "next.config.ts",
+            "svelte.config.js",
+        }
+        if ext in _fe_exts or parts & _fe_segs or name in _fe_names:
+            return "frontend"
+
+        # ── Ambiguous: .js/.ts/.json/README/etc. → frontend by default ──
+        return "frontend"
+
+    def _route_write_path(
+        self,
+        raw_path: str,
+        project_root: str,
+    ) -> str:
+        """Return the routed absolute path for a ``write_file`` action.
+
+        For fullstack projects, files are written into ``frontend/`` or
+        ``backend/`` subdirectories based on :meth:`_classify_file_path`.
+        Paths that already contain ``/frontend/`` or ``/backend/`` are
+        returned unchanged.  For non-fullstack projects the path is always
+        returned unchanged.
+        """
+        if self._project_architecture != "fullstack" or not self._project_dirs:
+            return raw_path
+
+        norm = raw_path.replace("\\", "/")
+
+        # Already explicitly routed by the LLM
+        if (
+            "/frontend/" in norm or norm.startswith("frontend/")
+            or "/backend/"  in norm or norm.startswith("backend/")
+        ):
+            return raw_path
+
+        bucket  = self._classify_file_path(raw_path)
+        subdir  = self._project_dirs.get(bucket, "")
+        if not subdir:
+            return raw_path
+
+        # Strip any project_root prefix so we don't double it
+        rel = norm
+        if project_root:
+            norm_root = project_root.replace("\\", "/").rstrip("/") + "/"
+            if rel.startswith(norm_root):
+                rel = rel[len(norm_root):]
+
+        import os as _os
+        return _os.path.join(subdir, rel)
+
+    # ------------------------------------------------------------------
+    # Action label formatting (used for live status display)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_action_label(tool_name: str, params: Dict[str, Any], rationale: str = "") -> str:
+        """Return a one-line status label for the current tool call.
+
+        Priority: LLM-generated rationale (if meaningful) → formatted from
+        tool name + key params.  The result is what appears in the live
+        progress bar while the action is running.
+
+        Args:
+            tool_name: Tool identifier string.
+            params:    Tool parameter dict.
+            rationale: LLM-generated rationale from the AgentAction.
+
+        Returns:
+            A short, human-readable action description.
+        """
+        p = params or {}
+
+        # ── Build a rich param-based label first so we can compare ──────────
+        if tool_name == "write_file":
+            import os as _os
+            path = p.get("path", "?")
+            fname = _os.path.basename(path) if path != "?" else "?"
+            param_label = f"Writing {fname}  ({path})" if fname != path else f"Writing {path}"
+        elif tool_name == "read_file":
+            import os as _os
+            path = p.get("path", "?")
+            param_label = f"Reading {_os.path.basename(path) or path}"
+        elif tool_name == "find_files":
+            param_label = f"Finding {p.get('pattern', '*')} in {p.get('path', '.')}"
+        elif tool_name == "run_shell":
+            cmd = str(
+                p.get("command")
+                or p.get("cmd")
+                or p.get("shell_command")
+                or ""
+            ).strip()
+            # Show the actual command (not just "Running:") so it's informative.
+            # Avoid rendering a bare "$" when command text is missing.
+            param_label = f"$ {cmd[:100]}" if cmd else "run_shell"
+        elif tool_name == "run_tests":
+            param_label = f"Running tests in {p.get('path', '.')}"
+        elif tool_name == "search_code":
+            param_label = f"Searching: {p.get('query', '?')}"
+        elif tool_name == "project_initializer":
+            pname = p.get("project_name", "")
+            ptype = p.get("project_type", "auto-detect")
+            param_label = f"Scaffolding {ptype} project: {pname}" if pname else f"Scaffolding {ptype} project"
+        elif tool_name == "install_dependency":
+            pkgs = p.get("packages", [])
+            param_label = f"Installing: {', '.join(pkgs[:4])}" if pkgs else "Installing dependency"
+        elif tool_name == "git_commit":
+            param_label = f"git commit: {p.get('message', '?')[:60]}"
+        else:
+            param_label = f"{tool_name}: {str(p)[:60]}"
+
+        # ── Prefer LLM rationale when it's genuinely informative ────────────
+        # Reject generic filler strings that add no value over the param label.
+        _filler = {
+            f"LLM-requested: {tool_name}",
+            f"LLM-requested: {tool_name.replace('_', '-')}",
+            tool_name,
+            tool_name.replace("_", " "),
+        }
+        if rationale and rationale.strip() not in _filler and len(rationale.strip()) > 8:
+            short = rationale.split(".")[0].strip()
+            # If the rationale is longer than the param label, it's likely more
+            # informative — prefer it.  Otherwise keep the param-based label
+            # since it always contains the concrete file/command name.
+            if len(short) > len(param_label) or any(
+                kw in short.lower() for kw in ("creat", "generat", "updat", "add", "implement", "fix", "remov")
+            ):
+                return short[:120]
+
+        return param_label
+
     def _dispatch_actions(
         self,
         actions: List[AgentAction],
@@ -1429,7 +2192,29 @@ class ConcreteExecutionEngine(ExecutionEngine):
 
             if action.action_type == "tool_call":
                 tool_name = action.payload.get("tool", "")
-                params = action.payload.get("params", {})
+                params: Dict[str, Any] = dict(action.payload.get("params", {}) or {})
+
+                # ── Glob-pattern redirect: read_file with a glob → find_files ──
+                # The LLM sometimes emits read_file actions with patterns such as
+                # "**\*.html" instead of using find_files.  Detect this and
+                # silently reroute so the user sees useful results rather than
+                # "File not found" errors.
+                import re as _re
+                _GLOB_RE = _re.compile(r"[\*\?\[]")
+                if tool_name == "read_file" and "path" in params and _GLOB_RE.search(params["path"]):
+                    raw_path: str = params["path"]
+                    _first = _GLOB_RE.search(raw_path).start()
+                    _dir   = raw_path[:_first].rstrip("/\\") or "."
+                    _pat   = raw_path[_first:].lstrip("/\\")
+                    tool_name = "find_files"
+                    params = {"pattern": _pat, "path": _dir}
+                    # Update the action reference so downstream logging is accurate
+                    action = AgentAction.tool_call(
+                        tool="find_files", params=params,
+                        agent=action.agent or "engine",
+                        step_id=action.step_id or "",
+                        rationale=f"[auto-redirect] read_file glob '{raw_path}' → find_files",
+                    )
 
                 # ── FileChangeMap: resolve logical→absolute before dispatch ──
                 if "path" in params and tool_name in (
@@ -1438,6 +2223,33 @@ class ConcreteExecutionEngine(ExecutionEngine):
                     resolved_abs = self.file_change_map.resolve(params["path"])
                     if resolved_abs:
                         params = {**params, "path": resolved_abs}
+
+                # ── Pre-dispatch validation: ensure required params exist ───
+                # install_dependency needs 'packages' (non-empty list/string)
+                if tool_name == "install_dependency":
+                    pkgs = params.get("packages") or []
+                    if isinstance(pkgs, str):
+                        pkgs = [pkgs]
+                    pkgs = [str(p).strip() for p in pkgs if str(p).strip()]
+                    if not pkgs:
+                        _blocked = {
+                            "tool_name": tool_name,
+                            "success": False,
+                            "output": None,
+                            "error": "Missing or empty 'packages' parameter for install_dependency",
+                            "elapsed_ms": 0.0,
+                            "metadata": params,
+                        }
+                        tool_results.append(_blocked)
+                        event_data["tool_result"] = _blocked
+                        self._emit(ProgressEvent(
+                            event="action_dispatched",
+                            step_name=action.agent,
+                            message=f"[{tool_name}] blocked: missing packages parameter",
+                            data=event_data,
+                        ))
+                        continue
+                    params["packages"] = pkgs
 
                 # ── Semantic validation ──────────────────────────────────
                 try:
@@ -1458,6 +2270,60 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 except Exception:
                     pass  # validator unavailable
                 # ── Approve before apply ──────────────────────────────────
+                # Update the live progress label so the user can see what
+                # action the agent is about to execute before the approval
+                # prompt appears (or while it runs in non-approval mode).
+                _action_label = self._format_action_label(
+                    tool_name, params, getattr(action, "rationale", "")
+                )
+                # Prefer context["step_index"] (always an int, injected by
+                # build_context) over action.step_id which is a UUID string —
+                # int(uuid) raises ValueError and was silently swallowed,
+                # so update_step_action was never actually called.
+                _step_idx: Optional[int] = None
+                if context:
+                    _raw_idx = context.get("step_index")
+                    if _raw_idx is not None:
+                        try:
+                            _step_idx = int(_raw_idx)
+                        except (TypeError, ValueError):
+                            pass
+                if _step_idx is None:
+                    _sid = getattr(action, "step_id", None)
+                    if _sid is not None:
+                        try:
+                            _step_idx = int(_sid)
+                        except (TypeError, ValueError):
+                            pass
+                if self._progress_tracker is not None and _step_idx is not None:
+                    try:
+                        self._progress_tracker.update_step_action(
+                            _step_idx, _action_label
+                        )
+                    except Exception:
+                        pass
+
+                if tool_name == "project_initializer":
+                    should_skip, skip_reason = self._maybe_skip_project_initializer(params, context)
+                    if should_skip:
+                        skipped = {
+                            "tool_name": tool_name,
+                            "success": True,
+                            "output": {"skipped": True, "reason": skip_reason},
+                            "error": None,
+                            "elapsed_ms": 0.0,
+                            "metadata": {**params, "skipped": True},
+                        }
+                        tool_results.append(skipped)
+                        event_data["tool_result"] = skipped
+                        self._emit(ProgressEvent(
+                            event="action_dispatched",
+                            step_name=action.agent,
+                            message=f"[{tool_name}] skipped (already initialized)",
+                            data=event_data,
+                        ))
+                        continue
+
                 if self._require_approval and tool_name in (
                     "write_file", "git_commit", "run_shell", "install_dependency", "project_initializer"
                 ):
@@ -1480,8 +2346,206 @@ class ConcreteExecutionEngine(ExecutionEngine):
                             data=event_data,
                         ))
                         continue
+
+                if tool_name in ("run_shell", "project_initializer"):
+                    review = self.review_shell_command(tool_name, params, context)
+                    decision = str(review.get("decision", "")).strip().lower()
+                    if decision == "skip":
+                        skipped = {
+                            "tool_name": tool_name,
+                            "success": True,
+                            "output": {"skipped": True, "reason": review.get("reason", "")},
+                            "error": None,
+                            "elapsed_ms": 0.0,
+                            "metadata": {
+                                **params,
+                                "supervisor_review": review,
+                                "skipped": True,
+                            },
+                        }
+                        tool_results.append(skipped)
+                        event_data["tool_result"] = skipped
+                        self._emit(ProgressEvent(
+                            event="action_dispatched",
+                            step_name=action.agent,
+                            message=f"[{tool_name}] skipped by supervisor",
+                            data=event_data,
+                        ))
+                        continue
+
+                    timeout_seconds = review.get("timeout_seconds")
+                    if timeout_seconds is not None:
+                        try:
+                            params = dict(params)
+                            params["timeout"] = max(1, int(timeout_seconds))
+                        except (TypeError, ValueError):
+                            pass
+
+                    if decision == "bounded_run" and tool_name == "run_shell":
+                        params = dict(params)
+                        params["watch_mode"] = True
+
+                    if tool_name == "run_shell" and decision != "skip":
+                        _cmd = str(params.get("command", "") or "")
+                        if self._looks_like_long_running_shell(_cmd):
+                            params = dict(params)
+                            params["watch_mode"] = True
+                            try:
+                                _cur_timeout = int(params.get("timeout", 120))
+                            except (TypeError, ValueError):
+                                _cur_timeout = 120
+                            params["timeout"] = min(max(1, _cur_timeout), 120)
+                            if self._progress_tracker is not None and _step_idx is not None:
+                                try:
+                                    self._progress_tracker.update_step_action(
+                                        _step_idx,
+                                        "Checking dev/watch command startup (bounded)",
+                                    )
+                                except Exception:
+                                    pass
+
+                    display_label = str(review.get("display_label", "")).strip()
+                    if display_label and self._progress_tracker is not None and _step_idx is not None:
+                        try:
+                            self._progress_tracker.update_step_action(_step_idx, display_label)
+                        except Exception:
+                            pass
+                # ── Inject progress_callback for project_initializer ──────────
+                if tool_name == "project_initializer" and self._progress_tracker is not None:
+                    _pt = self._progress_tracker
+                    _pidx = _step_idx
+                    def _progress_cb(line: str, _t=_pt, _i=_pidx) -> None:
+                        if _t is not None and _i is not None:
+                            _line = str(line or "").strip()
+                            if not _line:
+                                return
+                            try:
+                                _cmd_like = (
+                                    _line.startswith("$ ")
+                                    or _line.lower().startswith((
+                                        "npm ", "npx ", "pnpm ", "yarn ", "python ",
+                                        "pip ", "node ", "flutter ", "gradle ", "swift ",
+                                        "django-admin ",
+                                    ))
+                                )
+                                if _cmd_like:
+                                    label = _line if _line.startswith("$ ") else f"$ {_line}"
+                                else:
+                                    label = _line
+                                _t.update_step_action(_i, label[:80])
+                            except Exception:
+                                pass
+                    params = dict(params)
+                    params["progress_callback"] = _progress_cb
+
                 result = self._invoke_tool(tool_name, params, action, context)
+                self._record_shell_history(tool_name, params, result)
+
+                # ── Supervisor bus: notify on clean tool failure ───────────────
+                if not result.get("success", True) and self._supervisor_bus is not None:
+                    try:
+                        from core.supervisor_bus import BusEvent, BusEventType
+                        self._supervisor_bus.emit(BusEvent(
+                            type=BusEventType.TOOL_FAILED,
+                            step_id=str(action.step_id or ""),
+                            step_index=_step_idx if _step_idx is not None else -1,
+                            step_name=context.get("step_name", "") if context else "",
+                            tool_name=tool_name,
+                            error=result.get("error", ""),
+                            context=context or {},
+                            attempt=context.get("_attempt", 0) if context else 0,
+                            extra={"params": params, "result": result,
+                                   "agent": action.agent or ""},
+                        ))
+                        # Pause and wait for supervisor to fix or abort
+                        self.pause(f"Supervisor handling {tool_name} failure")
+                        self._pause_event.wait()
+                        if self._abort_flag:
+                            raise AbortException(self._abort_reason)
+                        # Drain any fix actions the supervisor injected
+                        while not self._fix_queue.empty():
+                            try:
+                                _tfix = self._fix_queue.get_nowait()
+                                _tfacts = getattr(_tfix, "fix_actions", []) or []
+                                _tfresults = self._dispatch_actions(_tfacts, context or {})
+                                tool_results.extend(_tfresults)
+                            except AbortException:
+                                raise
+                            except Exception:
+                                break
+                    except AbortException:
+                        raise
+                    except Exception:
+                        pass  # Never crash dispatch for supervisor integration
+
                 tool_results.append(result)
+
+                # ── Capture project architecture from project_initializer ──────
+                # Store architecture and subdirectory paths so subsequent
+                # write_file calls can be routed to frontend/ or backend/.
+                if tool_name == "project_initializer" and result.get("success"):
+                    _out = result.get("output") or result.get("metadata") or {}
+                    _arch = (
+                        _out.get("architecture")
+                        or (_out.get("metadata") or {}).get("architecture", "")
+                    )
+                    if _arch == "fullstack":
+                        self._project_architecture = "fullstack"
+                        self._project_dirs = {
+                            "frontend": _out.get("frontend_dir", ""),
+                            "backend":  _out.get("backend_dir",  ""),
+                        }
+                    elif _arch in ("frontend", "backend"):
+                        self._project_architecture = _arch
+                        self._project_dirs = {}
+                    # Propagate a renamed/sanitized directory into context so
+                    # subsequent steps (write_file, run_shell, read_file) use
+                    # the corrected path.  project_initializer now computes the
+                    # safe path BEFORE creating the directory, so renamed_dir
+                    # is always set when the basename needed sanitization.
+                    _renamed = _out.get("renamed_dir") or _out.get("project_path")
+                    if _renamed and context:
+                        context["project_root"] = _renamed
+                    # ── Inject scaffolded file listing into context ──────────
+                    # Walk the initialised directory and record all files in
+                    # file_change_map AND in context["known_files"] so that
+                    # the coding agent can reference real paths (e.g. it knows
+                    # index.html lives at public/index.html in a CRA scaffold,
+                    # not at the project root).
+                    _proj_path = _renamed or _out.get("output_dir", "")
+                    if _proj_path and os.path.isdir(_proj_path):
+                        try:
+                            import time as _time2
+                            from core.file_change_map import FileChangeEvent as _FCE
+                            _known: list = []
+                            for _root, _dirs, _fnames in os.walk(_proj_path):
+                                # Skip hidden dirs and node_modules / venv
+                                _dirs[:] = [
+                                    d for d in _dirs
+                                    if d not in ("node_modules", "venv", ".git",
+                                                 "__pycache__", ".next", "dist", "build")
+                                    and not d.startswith(".")
+                                ]
+                                for _fname in _fnames:
+                                    _abs = os.path.join(_root, _fname)
+                                    _rel = os.path.relpath(_abs, _proj_path)
+                                    _known.append(_rel)
+                                    # Register in file_change_map so read_file
+                                    # can resolve relative paths to absolute ones.
+                                    if not self.file_change_map.resolve(_rel):
+                                        self.file_change_map.record(_FCE(
+                                            logical_path=_rel,
+                                            absolute_path=_abs,
+                                            operation="create",
+                                            step_id=action.step_id or "",
+                                            agent="project_initializer",
+                                            timestamp_ms=int(_time2.time() * 1000),
+                                        ))
+                            if context is not None:
+                                context["known_files"] = _known
+                            self._known_files = sorted(set(_known))
+                        except Exception:
+                            pass  # Non-critical — never break execution
                 event_data["tool_result"] = result
 
                 # ── FileChangeMap: record successful write_file ──────────
@@ -1495,7 +2559,12 @@ class ConcreteExecutionEngine(ExecutionEngine):
                             or logical_path
                         )
                         from pathlib import Path as _Path
-                        existed_before = _Path(absolute_path).exists() if absolute_path else False
+                        # Record BEFORE the existence check so we capture the
+                        # operation correctly (file was just written, so it now
+                        # exists — check whether it existed BEFORE this write).
+                        existed_before = (
+                            self.file_change_map.resolve(logical_path) is not None
+                        )
                         operation = "modify" if existed_before else "create"
                         self.file_change_map.record(FileChangeEvent(
                             logical_path=logical_path,
@@ -1505,6 +2574,17 @@ class ConcreteExecutionEngine(ExecutionEngine):
                             agent=action.agent or "",
                             timestamp_ms=int(_time.time() * 1000),
                         ))
+                        # Keep context["known_files"] in sync so the coding
+                        # agent's next turn sees newly written files.
+                        if context is not None:
+                            _kf = context.setdefault("known_files", [])
+                            _rel_or_abs = logical_path
+                            if _rel_or_abs not in _kf:
+                                _kf.append(_rel_or_abs)
+                        if logical_path:
+                            _norm = logical_path.replace("\\", "/")
+                            if _norm not in self._known_files:
+                                self._known_files.append(_norm)
                     except Exception:
                         pass  # Never break execution for telemetry
 
@@ -1531,19 +2611,37 @@ class ConcreteExecutionEngine(ExecutionEngine):
         """Ask the user to approve a destructive tool call.
 
         Returns True if approved, False if declined.
+
+        The user can provide one of three responses:
+        - Y (yes, empty string) — approve this call only
+        - N (no)               — decline this call
+        - A (all, auto-approve) — approve this and all future approval
+                                  requests in the current session
         """
+        # If session auto-approve is already enabled, skip prompt
+        if self._auto_approve_session:
+            return True
+
         try:
-            from rich.console import Console as _Console
-            from rich.panel import Panel as _Panel
-            
-            # Pause the live progress display to allow clean user input
-            if self._progress_tracker is not None:
-                try:
-                    self._progress_tracker.pause()
-                except Exception:
-                    pass
-            
-            con = self._console or _Console()
+            from contextlib import nullcontext
+            from rich.panel import Panel  # (was incorrectly "_Panel")
+
+            # ── Console selection ─────────────────────────────────────────
+            # Always use the tracker's console when available so that output
+            # is routed through the same Rich Console instance that owns the
+            # Live display.  Creating a separate Console would desync Rich's
+            # internal line-counting and corrupt the re-drawn progress bars.
+            tracker = self._progress_tracker
+            con = (
+                tracker.console
+                if tracker is not None and getattr(tracker, "console", None) is not None
+                else self._console
+            )
+            if con is None:
+                from rich.console import Console as _FallbackConsole
+                con = _FallbackConsole()
+
+            # ── Build detail line ─────────────────────────────────────────
             if tool_name == "write_file":
                 detail = f"Write → [bold]{params.get('path', '?')}[/bold]"
             elif tool_name == "run_shell":
@@ -1551,41 +2649,86 @@ class ConcreteExecutionEngine(ExecutionEngine):
             elif tool_name == "git_commit":
                 detail = f"Git commit: [bold]{params.get('message', '?')}[/bold]"
             elif tool_name == "install_dependency":
-                detail = f"Install packages: [bold]{params.get('packages', [])}[/bold]"
+                pkgs = params.get('packages', [])
+                if not pkgs:
+                    pkgs = "(no packages specified)"
+                elif isinstance(pkgs, list):
+                    pkgs = ", ".join(pkgs[:3])
+                detail = f"Install packages: [bold]{pkgs}[/bold]"
             elif tool_name == "project_initializer":
-                detail = f"Init project → [bold]{params.get('project_name', '?')}[/bold] ({params.get('project_type', 'auto-detect')})"
+                detail = (
+                    f"Init project → [bold]{params.get('project_name', '?')}[/bold]"
+                    f" ({params.get('project_type', 'auto-detect')})"
+                )
             else:
                 detail = str(params)
-            con.print(_Panel(
+
+            approval_panel = Panel(
                 f"[yellow]Sentinel wants to execute:[/yellow]\n{detail}",
-                title="[bold yellow]⚠ Approval Required[/bold yellow]",
+                title="[bold yellow]⚠  Approval Required[/bold yellow]",
                 border_style="yellow",
-            ))
-            
-            # Use standard input with explicit prompt
-            import sys
-            sys.stdout.write("  Apply? [Y/n] › ")
-            sys.stdout.flush()
-            answer = sys.stdin.readline().strip().lower()
-            
-            approved = answer in ("", "y", "yes")
-            
-            # Resume the live progress display
-            if self._progress_tracker is not None:
+            )
+
+            # ── Pause → prompt → resume ───────────────────────────────────
+            # paused_for_input() guarantees the Live refresh thread has
+            # fully stopped before we write anything, so the panel and the
+            # input prompt are never torn by a concurrent display refresh.
+            # The Live display is always resumed in the finally block —
+            # even if input() raises KeyboardInterrupt or EOFError.
+            pause_ctx = (
+                tracker.paused_for_input()
+                if tracker is not None
+                else nullcontext()
+            )
+
+            answer = ""
+            with pause_ctx:
+                con.print(approval_panel)
                 try:
-                    self._progress_tracker.resume()
-                except Exception:
-                    pass
-            
-            return approved
-        except Exception as e:
-            # Resume on error
-            if self._progress_tracker is not None:
+                    # input() flushes stdout and handles the cursor correctly
+                    # on both Windows (conhost/WT) and Unix terminals.
+                    answer = input("  Apply? [Y/n/A] › ").strip().lower()
+                except EOFError:
+                    # Non-interactive stdin (pipe, CI) — default deny so the
+                    # caller decides rather than silently proceeding.
+                    answer = "n"
+                except KeyboardInterrupt:
+                    con.print("\n[dim]Interrupted — treating as deny.[/dim]")
+                    answer = "n"
+
+            # ── Evaluate answer ───────────────────────────────────────────
+            if answer in ("a", "accept all", "auto-approve"):
+                self._auto_approve_session = True
+                return True
+            return answer in ("", "y", "yes")
+
+        except Exception as _approval_err:
+            # Something went wrong inside the Rich rendering path (broken
+            # console, import failure, etc.).  Never silently auto-approve in
+            # an interactive session — always give the user a chance to decide.
+            import sys as _sys
+            if _sys.stdin.isatty():
+                # Interactive session: fall back to a plain-text prompt so
+                # the approval is NEVER silently skipped for a real user.
                 try:
-                    self._progress_tracker.resume()
+                    _sys.stdout.write(
+                        f"\n[approval required — rich display failed: {_approval_err}]\n"
+                        f"  Tool: {tool_name}  params: {str(params)[:120]}\n"
+                        f"  Apply? [Y/n/A] › "
+                    )
+                    _sys.stdout.flush()
+                    _raw = _sys.stdin.readline().strip().lower()
+                    if _raw in ("a", "accept all", "auto-approve"):
+                        self._auto_approve_session = True
+                        return True
+                    return _raw in ("", "y", "yes")
                 except Exception:
-                    pass
-            return True   # Non-interactive (CI/test) — default allow
+                    # stdin is completely broken — deny to be safe
+                    return False
+            else:
+                # Non-interactive (CI, pipe) — auto-allow so pipelines
+                # are not silently blocked in headless environments.
+                return True
 
     # ------------------------------------------------------------------
     # Tool invocation
@@ -1628,9 +2771,23 @@ class ConcreteExecutionEngine(ExecutionEngine):
             if tool_name in ("write_file", "read_file"):
                 params = {**params, "project_root": _proj}
             elif tool_name in ("search_code", "run_tests"):
-                # Default path to the project root when the agent left it at "."
                 if not params.get("path") or params.get("path") == ".":
                     params = {**params, "path": _proj}
+            elif tool_name == "project_initializer":
+                if not params.get("output_dir") or params.get("output_dir") == ".":
+                    params = {**params, "output_dir": _proj}
+            elif tool_name == "find_files":
+                if not params.get("path") or params.get("path") == ".":
+                    params = {**params, "path": _proj}
+
+        # For fullstack projects: route write_file paths into the correct
+        # frontend/ or backend/ subdirectory at the engine level so the agent
+        # doesn't need to know the exact directory layout.
+        if tool_name == "write_file":
+            _proj_root = (context or {}).get("project_root", "")
+            _routed = self._route_write_path(params.get("path", ""), _proj_root)
+            if _routed != params.get("path", ""):
+                params = {**params, "path": _routed}
 
         try:
             raw = self._tools.invoke(tool_name, params)
@@ -1720,4 +2877,4 @@ class ConcreteExecutionEngine(ExecutionEngine):
         finally:
             self.on_progress = original_callback
 
-        yield from collected
+        yield from collected# Changed core/execution_engine.py

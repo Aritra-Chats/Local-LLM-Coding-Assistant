@@ -169,22 +169,6 @@ sentinel › Write unit tests for the UserService class in src/services/user.py
 sentinel › First read the README, then add a docker-compose.yml that matches the setup instructions
 ```
 
-### Project initialization examples
-
-Use Sentinel to scaffold new projects with `project_initializer` automatically invoked:
-
-```
-sentinel › Create a new FastAPI project with SQLAlchemy models and Alembic migrations
-
-sentinel › Scaffold a React + TypeScript app with Vite and Tailwind CSS
-
-sentinel › Initialize a Python CLI tool with Click framework and unit tests
-
-sentinel › Set up a new Next.js full-stack app with authentication and database models
-```
-
-Sentinel will automatically select appropriate project templates, install dependencies, and generate initial file structure based on your description.
-
 ---
 
 ## 6. Session Management
@@ -290,67 +274,6 @@ sentinel › /mode standard
 ```
 
 `/mode` updates the current session metadata. Restart Sentinel with `--mode` to apply the mode change to model routing.
-
----
-
-## 9. Hardware Modes
-
-Sentinel auto-detects your hardware on startup. You can view the detected mode in the startup output or check it with `/session`.
-
-| Mode | RAM | Models used | Pipeline concurrency |
-|---|---|---|---|
-| **minimal** | 8–12 GB | `codellama:7b` + `mistral:7b` | 1 (sequential) |
-| **standard** | 12–20 GB | `codellama:13b` + `mixtral:8x7b` | 2 |
-| **advanced** | ≥ 20 GB or GPU | `codellama:34b` + `mixtral:8x7b` | 4 |
-
-### Override for one session
-
-```bash
-sentinel --hw-mode minimal
-```
-
-### Override at runtime
-
-```
-sentinel › /mode standard
-```
-
-`/mode` updates the current session metadata. Restart Sentinel with `--mode` to apply the mode change to model routing.
-
----
-
-## 9.1. Online and Offline Modes
-
-Sentinel can operate in two connectivity modes:
-
-| Mode | Behavior | When to use |
-|---|---|---|
-| **online** | Routes complex reasoning tasks to larger cloud models (if available); falls back to local models | When you have API access and want higher quality reasoning |
-| **offline** | All tasks run on local Ollama models only; 100% data privacy | Default; recommended for secure environments or when API access unavailable |
-
-### Choose at startup (interactive)
-
-On first launch, Sentinel prompts you to choose:
-
-```
-╭─ Connectivity Mode ─╮
-│ Select one:         │
-│ › Online            │
-│   Offline           │
-╰─────────────────────╯
-```
-
-### Force a mode with flags
-
-```bash
-sentinel --online
-sentinel --offline
-sentinel --online --hw-mode standard
-```
-
-### Switch at runtime
-
-Currently requires restarting Sentinel. The mode is persisted per session; use `--resume` to keep the same mode.
 
 ---
 

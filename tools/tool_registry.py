@@ -155,7 +155,7 @@ class Tool:
     parameters_schema: Dict[str, Any] = {}
 
     # Params silently injected by the execution engine — never treat as unknown.
-    _INTERNAL_PARAMS: frozenset = frozenset({"project_root"})
+    _INTERNAL_PARAMS: frozenset = frozenset({"project_root", "progress_callback"})
 
     def run(self, **kwargs: Any) -> ToolResult:
         """Execute the tool.  Subclasses must override."""

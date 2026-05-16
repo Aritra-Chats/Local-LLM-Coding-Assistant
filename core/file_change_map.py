@@ -16,6 +16,7 @@ end it is saved to::
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
@@ -44,6 +45,40 @@ class FileChangeEvent(NamedTuple):
     step_id: str
     agent: str
     timestamp_ms: int
+
+
+def _path_variant_matches(requested: str, candidate: str) -> bool:
+    """Return True when two logical paths are close enough to resolve safely."""
+    requested_path = requested.replace("\\", "/").strip()
+    candidate_path = candidate.replace("\\", "/").strip()
+
+    if requested_path.lower() == candidate_path.lower():
+        return True
+
+    requested_parent = os.path.dirname(requested_path)
+    candidate_parent = os.path.dirname(candidate_path)
+    if requested_parent and requested_parent.lower() != candidate_parent.lower():
+        return False
+
+    requested_base = os.path.basename(requested_path)
+    candidate_base = os.path.basename(candidate_path)
+    if requested_base.lower() == candidate_base.lower():
+        return True
+
+    requested_stem, requested_ext = os.path.splitext(requested_base)
+    candidate_stem, candidate_ext = os.path.splitext(candidate_base)
+    if requested_ext.lower() != candidate_ext.lower():
+        return False
+
+    requested_stem = requested_stem.lower()
+    candidate_stem = candidate_stem.lower()
+    if requested_stem == candidate_stem:
+        return True
+
+    if requested_stem + "s" == candidate_stem or candidate_stem + "s" == requested_stem:
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +126,24 @@ class FileChangeMap:
         Returns:
             The resolved absolute path string, or ``None`` if not found.
         """
-        return self._index.get(logical_path)
+        resolved = self._index.get(logical_path)
+        if resolved is not None:
+            return resolved
+
+        normalized = logical_path.replace("\\", "/")
+        resolved = self._index.get(normalized)
+        if resolved is not None:
+            return resolved
+
+        candidates: List[str] = []
+        for event in reversed(self._events):
+            if _path_variant_matches(logical_path, event.logical_path):
+                candidates.append(event.absolute_path)
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        return None
 
     def all_events(self) -> List[FileChangeEvent]:
         """Return all recorded events in chronological order."""

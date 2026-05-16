@@ -329,9 +329,16 @@ class OllamaClient:
     ) -> Dict[str, Any]:
         """POST body to path with automatic retry / exponential back-off.
 
+        *timeout* is used both as the per-socket-read deadline and as the
+        overall wall-clock budget for a single attempt.  A background thread
+        closes the connection if the wall-clock limit is exceeded so that
+        very slow (or hung) models cannot block indefinitely.
+
         Raises:
             RuntimeError: When all retry attempts are exhausted.
         """
+        import threading as _threading
+
         payload = json.dumps(body).encode()
         url = f"{self.base_url}{path}"
         attempt = 0
@@ -343,26 +350,62 @@ class OllamaClient:
                 data=payload,
                 headers={"Content-Type": "application/json"},
             )
-            try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+
+            # --- wall-clock watchdog ---
+            # urllib's socket timeout resets on every successful recv(), so a
+            # model that trickles data (or holds the connection open while
+            # "thinking") can exceed the intended timeout by a large margin.
+            # We use a threading.Timer to forcibly interrupt after `timeout`s.
+            _resp_holder: Dict[str, Any] = {}
+            _exc_holder:  Dict[str, Exception] = {}
+            _conn_holder: list = []  # holds the urlopen response object
+
+            def _do_request() -> None:
+                try:
+                    resp = urllib.request.urlopen(req, timeout=timeout)
+                    _conn_holder.append(resp)
                     raw = resp.read()
                     result: Dict[str, Any] = json.loads(raw)
-                    # Normalise: ensure "response" key always exists
                     if "response" not in result and "message" in result:
                         result["response"] = result["message"].get("content", "")
                     elif "response" not in result:
                         result["response"] = ""
-                    return result
+                    _resp_holder["result"] = result
+                except Exception as exc:  # noqa: BLE001
+                    _exc_holder["exc"] = exc
 
-            except urllib.error.HTTPError as exc:
-                if 400 <= exc.code < 500:
+            worker = _threading.Thread(target=_do_request, daemon=True)
+            worker.start()
+            # Give the request slightly longer than the socket timeout so the
+            # socket timeout fires first under normal slow-network conditions;
+            # the hard wall-clock cut-off is 20 s more than the declared timeout.
+            wall_limit = timeout + 20
+            worker.join(wall_limit)
+
+            if worker.is_alive():
+                # Request exceeded wall-clock limit — close the response socket
+                # to unblock the worker thread, then treat it as a timeout error.
+                for _r in _conn_holder:
+                    try:
+                        _r.close()
+                    except Exception:
+                        pass
+                worker.join(2)  # brief grace period
+                last_exc = TimeoutError(
+                    f"OllamaClient: wall-clock timeout ({wall_limit}s) exceeded "
+                    f"for {path} (model={body.get('model', '?')})"
+                )
+            elif "result" in _resp_holder:
+                return _resp_holder["result"]
+            elif "exc" in _exc_holder:
+                exc = _exc_holder["exc"]
+                if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500:
                     raise RuntimeError(
                         f"OllamaClient HTTP {exc.code} on {path}: {exc.reason}"
                     ) from exc
                 last_exc = exc
-
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                last_exc = exc
+            # else: thread finished without result or exc — treat as error
+            # and fall through to retry logic
 
             if attempt >= self.max_retries:
                 raise RuntimeError(

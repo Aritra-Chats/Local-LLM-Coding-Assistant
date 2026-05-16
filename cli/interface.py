@@ -528,7 +528,7 @@ def _print_banner() -> None:
             "[bold white]Sentinel[/bold white] · Local Autonomous Development Assistant\n"
             "[dim]Type a task or [bold]/help[/bold] to see available commands.[/dim]",
             border_style="cyan",
-            expand=False,
+            expand=True,
         )
     )
 
