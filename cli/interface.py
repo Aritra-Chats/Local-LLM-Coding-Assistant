@@ -21,6 +21,8 @@ from cli.command_palette import Command, CommandParser, ParsedInput
 from cli.diff_viewer import DiffViewer
 from cli.display import PipelineViewer
 from cli.display import ProgressTracker
+import threading
+from cli.progress_tracker import NEED_INPUT, BACKEND_DONE
 from memory.session_store import SessionManager
 
 console = Console()
@@ -63,6 +65,7 @@ class InteractiveUI:
             auto_suggest=AutoSuggestFromHistory(),
             style=_PROMPT_STYLE,
         )
+        self._backend_thread: Optional[threading.Thread] = None
         self._register_commands()
 
     # ------------------------------------------------------------------
@@ -72,10 +75,30 @@ class InteractiveUI:
     def run(self) -> None:
         """Start the interactive REPL loop.
 
-        Reads input until /exit is issued or an interrupt is received.
+        The main thread alternates between two states:
+
+        REPL state
+            prompt_session.prompt() blocks on stdin. No pipeline is running.
+
+        RENDER state
+            self.progress._drain_one() blocks on the render queue while the
+            backend supervisor thread executes the pipeline. Worker threads
+            enqueue display callables consumed here.
+
+            NEED_INPUT sentinel: backend needs approval. Lives already stopped
+            by paused_for_input() on the backend. Main thread prints panel,
+            reads answer via prompt_session.prompt(), puts answer in
+            progress._response_queue.
+
+            BACKEND_DONE sentinel: pipeline finished. Exit render loop,
+            return to REPL state.
         """
         self._running = True
+        tracker = self.progress
+
         while self._running:
+
+            # ── REPL state ────────────────────────────────────────────────
             try:
                 raw = self._prompt_session.prompt(
                     [("class:prompt", "sentinel › ")]
@@ -96,8 +119,61 @@ class InteractiveUI:
                         f"[bold red]Unknown command:[/bold red] /{parsed.command}  "
                         "[dim](type /help for available commands)[/dim]"
                     )
-            elif parsed.is_task:
-                self._handle_task(parsed.raw.strip())
+                continue
+
+            if not parsed.is_task:
+                continue
+
+            # ── Spawn backend supervisor thread ───────────────────────────
+            prompt_text = parsed.raw.strip()
+
+            def _backend_target(p: str = prompt_text) -> None:
+                try:
+                    self._handle_task(p)
+                finally:
+                    if tracker._render_queue is not None:
+                        tracker._render_queue.put(BACKEND_DONE)
+
+            self._backend_thread = threading.Thread(
+                target=_backend_target,
+                daemon=True,
+                name="sentinel-backend",
+            )
+            self._backend_thread.start()
+
+            # ── RENDER state ──────────────────────────────────────────────
+            if tracker._render_queue is None:
+                # Rich unavailable — block until backend finishes.
+                self._backend_thread.join()
+                self._backend_thread = None
+                continue
+
+            while True:
+                item = tracker._drain_one()
+
+                if item is BACKEND_DONE:
+                    break
+
+                if item is NEED_INPUT:
+                    # Lives already stopped by paused_for_input() on backend.
+                    # Main thread owns the terminal; print panel and read.
+                    panel = tracker._pending_approval_panel
+                    if panel is not None:
+                        tracker.console.print(panel)
+                        tracker._pending_approval_panel = None
+
+                    try:
+                        answer = self._prompt_session.prompt(
+                            [("class:prompt", "  Apply? [Y/n/A] › ")]
+                        ).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        answer = "n"
+
+                    # paused_for_input() finally-block restarts Lives and
+                    # clears _backend_active when response_queue.get() returns.
+                    tracker._response_queue.put(answer)
+
+            self._backend_thread = None
 
     # ------------------------------------------------------------------
     # Task handler (stub — wired to pipeline in full implementation)

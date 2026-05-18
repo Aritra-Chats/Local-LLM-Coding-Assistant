@@ -24,3 +24,7 @@ cloud_models.json
 # OS
 .DS_Store
 Thumbs.db
+
+#Documentation
+docs/
+*.md

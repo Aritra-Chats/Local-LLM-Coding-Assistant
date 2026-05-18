@@ -1,379 +1,298 @@
 # Installation Guide
 
-This guide covers all required steps to get Sentinel running on Windows, Linux, and macOS.
-
----
+This guide covers full installation and bootstrap of Sentinel on Windows, Linux, and macOS. It includes offline preparation, Ollama model management, environment configuration, and troubleshooting steps.
 
 ## Table of Contents
 
-1. [Prerequisites](#1-prerequisites)
-2. [Standard Installation](#2-standard-installation)
-3. [Windows Quick Start](#3-windows-quick-start)
-4. [Linux / macOS Quick Start](#4-linux--macos-quick-start)
-5. [Ollama Setup](#5-ollama-setup)
-6. [Model Selection](#6-model-selection)
-7. [Environment Variables](#7-environment-variables)
-8. [Offline Installation](#8-offline-installation)
-9. [GPU Setup](#9-gpu-setup)
-10. [Troubleshooting](#10-troubleshooting)
+1. Prerequisites
+2. Standard installation and bootstrap
+3. Windows quick start (detailed)
+4. Linux / macOS quick start (detailed)
+5. Ollama setup and model management
+6. Environment variables and configuration
+7. Offline / air-gapped installation
+8. GPU specifics (NVIDIA / AMD / Apple)
+9. Troubleshooting and diagnostics
+
+## Interactive features
+
+This file includes interactive-friendly Markdown patterns:
+
+- Task lists: use the checkboxes to track progress when following the guide.
+- Collapsible advanced sections: expand `<details>` blocks for advanced or platform-specific instructions.
+- Mermaid diagrams: architecture and bootstrap flows use fenced mermaid blocks.
+
+Example quick checklist:
+
+- [ ] Clone repository
+- [ ] Create and activate virtualenv
+- [ ] Install dependencies
+- [ ] Run `sentinel --project` bootstrap
 
 ---
 
 ## 1. Prerequisites
 
-| Requirement | Version | Notes |
-|---|---|---|
-| **Python** | 3.11 or later | 3.12 / 3.13 also supported |
-| **Ollama** | Latest | [ollama.ai/download](https://ollama.ai/download) |
-| **RAM** | ≥ 8 GB | 16 GB+ recommended for a good experience |
-| **Disk** | ≥ 10 GB free | Model storage: 7B ≈ 4 GB, 13B ≈ 8 GB, 34B ≈ 20 GB |
-| **Git** | Any recent | Optional; required for git-related tools |
+Software:
 
-### Python version check
+- Python 3.11+ (3.12/3.13 supported)
+- Git (recommended)
+- Ollama (local model runtime)
 
-```bash
-python --version
-# Should print: Python 3.11.x or later
-```
+Hardware:
+
+- Minimum: 8 GB RAM (minimal mode)
+- Recommended: 16 GB+ for comfortable operation
+- GPU: optional; improves performance for large models
+
+Network:
+
+- Online mode: network access required for initial bootstrapping and pulling models
+- Offline mode: supported via pre-downloaded Ollama models and wheel packages
 
 ---
 
-## 2. Standard Installation
+## 2. Standard installation and bootstrap
+
+1. Clone and enter repository:
 
 ```bash
-# 1. Clone
-git clone https://github.com/Aritra-Chats/Local-LLM-Coding-Assistant.git
+git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
 cd Local-LLM-Coding-Assistant
-
-# 2. Add the Sentinel folder to your PATH
-#    Windows example: setx PATH "%PATH%;C:\tools\local-llm-assistant"
-
-# 3. Open a new PowerShell window and launch Sentinel
-sentinel --project C:\work\my-project
-
-# 4. Copy environment template (optional, only if you want to override defaults)
-cp .env.example .env           # Linux / macOS
-copy .env.example .env         # Windows
 ```
 
-On first launch Sentinel will automatically:
-- Detect your hardware and select a hardware mode
-- Create a local Python virtual environment under the Sentinel folder
-- Install any missing Python packages into that venv
-- Install Ollama with winget if it is missing
-- Prompt you to choose ONLINE or OFFLINE mode with arrow-key navigation
-- Pull only the Ollama models required for the chosen startup mode
-- Create `~/.sentinel/` workspace directories
-
----
-
-## 3. Windows Quick Start
-
-```powershell
-# Clone
-git clone https://github.com/Aritra-Chats/Local-LLM-Coding-Assistant.git
-cd Local-LLM-Coding-Assistant
-
-# Add the folder to PATH, then open a new PowerShell window
-
-# Launch
-sentinel --project C:\work\my-project
-
-# Fallback if you want to run the repo directly from its folder
-python main.py
-```
-
----
-
-## 4. Linux / macOS Quick Start
+2. Create and activate a virtual environment:
 
 ```bash
-git clone https://github.com/Aritra-Chats/Local-LLM-Coding-Assistant.git
-cd Local-LLM-Coding-Assistant
-
-sentinel
+python -m venv .venv
+source .venv/bin/activate    # macOS / Linux
+.venv\Scripts\Activate.ps1  # Windows PowerShell
 ```
 
-Make the `sentinel` script executable and add it to your PATH (one-time):
+3. Install Python dependencies:
 
 ```bash
-chmod +x sentinel
-# Option A: symlink into a PATH directory (recommended)
-sudo ln -s "$(pwd)/sentinel" /usr/local/bin/sentinel
-
-# Option B: add the repository folder to your PATH in your shell profile:
-# echo 'export PATH="$PATH:$(pwd)"' >> ~/.bashrc && source ~/.bashrc
-```
-
----
-
-## 5. Use Sentinel From Another Project Repo
-
-If your goal is to work on a separate project repository, keep Sentinel installed in its own folder and point it at the project you want to edit.
-
-### One-time setup
-
-```powershell
-# 1. Download or clone Sentinel somewhere stable, for example:
-cd C:\tools\local-llm-assistant
-
-# 2. Add that folder to PATH, then open a new PowerShell window
-
-# 3. Verify the command is available
-Get-Command sentinel
-```
-
-### Start Sentinel against your project repo
-
-```powershell
-# Option A: pass the project repo each time
-sentinel --project C:\work\my-project
-
-# Option B: make one project the default for this shell session
-$env:SENTINEL_PROJECT_DIR = "C:\work\my-project"
-sentinel
-```
-
-If you want the command available in future PowerShell windows, keep the Sentinel folder on PATH. The batch file is what makes PATH-based launching work.
-
----
-
-## 6. Ollama Setup
-
-Sentinel requires [Ollama](https://ollama.ai) running locally.
-
-### Install Ollama
-
-**Windows:** Download and run the installer from [ollama.ai/download](https://ollama.ai/download).
-
-**macOS:**
-```bash
-brew install ollama
-```
-
-**Linux:**
-```bash
-curl -fsSL https://ollama.ai/install.sh | sh
-```
-
-### Start Ollama
-
-Ollama runs as a background service after installation. To start it manually:
-
-```bash
-ollama serve
-```
-
-Verify it is running:
-
-```bash
-ollama list        # should print available models (empty on first install)
-curl http://localhost:11434/api/tags   # should return {"models":[...]}
-```
-
-### Pull models manually (optional)
-
-Sentinel's bootstrap step pulls models automatically. To pull them yourself:
-
-```bash
-# Minimal mode (8–12 GB RAM)
-ollama pull codellama:7b
-ollama pull mistral:7b
-ollama pull nomic-embed-text
-
-# Standard mode (12–20 GB RAM)
-ollama pull codellama:13b
-ollama pull mixtral:8x7b
-ollama pull nomic-embed-text
-
-# Advanced mode (≥ 20 GB RAM or GPU ≥ 6 GB VRAM)
-ollama pull codellama:34b
-ollama pull mixtral:8x7b
-ollama pull nomic-embed-text
-```
-
----
-
-## 7. Model Selection
-
-Sentinel auto-selects models based on your hardware. You can override:
-
-On first launch, the operating-mode prompt uses keyboard navigation instead of numeric input.
-
-### Override for the current session
-
-```bash
-sentinel --hw-mode minimal        # force minimal models
-sentinel --hw-mode standard       # force standard models
-sentinel --hw-mode advanced       # force advanced models
-```
-
-### Make mode override your default
-
-There is currently no dedicated environment variable for hardware mode.
-Use a shell alias or launcher script to always start with your preferred mode:
-
-```bash
-sentinel --hw-mode standard
-```
-
-### Alternative models
-
-Any Ollama-compatible model works. Well-tested alternatives:
-
-| Purpose | Alternatives |
-|---|---|
-| Code generation | `deepseek-coder:6.7b`, `qwen2.5-coder:7b`, `starcoder2:7b` |
-| Reasoning | `llama3:8b`, `phi3:medium`, `gemma2:9b` |
-| Large context | `llama3:70b` (requires ≥ 40 GB RAM or large GPU) |
-
----
-
-## 8. Environment Variables
-
-Copy `.env.example` to `.env` and adjust as needed:
-
-```env
-# Where Sentinel stores sessions, metrics, and index files
-# Default: %USERPROFILE%\.sentinel  (Windows)
-#          ~/.sentinel              (Linux / macOS)
-SENTINEL_HOME=C:\Users\you\.sentinel
-
-# Ollama API URL (change if Ollama runs on a different host/port)
-OLLAMA_BASE_URL=http://localhost:11434
-
-# Embedding model
-SENTINEL_EMBEDDING_MODEL=nomic-embed-text
-
-# Context window token budget (per pipeline step)
-SENTINEL_TOKEN_BUDGET=3000
-
-# Optional default project directory (used when --project is not passed)
-SENTINEL_PROJECT_DIR=C:\code\my-project
-```
-
----
-
-## 9. Offline Installation
-
-For air-gapped environments:
-
-### Step 1 — Download models on a connected machine
-
-```bash
-ollama pull codellama:7b
-ollama pull nomic-embed-text
-
-# Locate the model files (default Ollama model directory)
-# Linux / macOS: ~/.ollama/models/
-# Windows:       %USERPROFILE%\.ollama\models\
-```
-
-Copy the entire `~/.ollama/models/` directory to the target machine.
-
-### Step 2 — Pre-download Python packages
-
-```bash
-pip download -r requirements.txt -d ./packages
-```
-
-Copy `packages/` to the target machine, then install offline:
-
-```bash
-pip install --no-index --find-links=./packages -r requirements.txt
-```
-
-### Step 3 — Skip bootstrap network checks
-
-```bash
-sentinel --no-bootstrap
-```
-
----
-
-## 10. GPU Setup
-
-### NVIDIA (CUDA)
-
-Ensure CUDA drivers are installed. Ollama detects CUDA automatically. Verify:
-
-```bash
-nvidia-smi          # should list your GPU
-ollama run codellama:7b "hello"    # should show VRAM usage
-```
-
-### AMD (ROCm) — Linux only
-
-Install ROCm drivers from [rocm.docs.amd.com](https://rocm.docs.amd.com). Ollama includes ROCm support; verify with `ollama run`.
-
-### Apple Silicon (Metal)
-
-Ollama uses Metal automatically on Apple Silicon Macs. Sentinel will detect `has_metal = True` and set Advanced mode.
-
----
-
-## 11. Troubleshooting
-
-### `ollama: command not found`
-
-Ollama is not on your PATH. Either install it or set:
-
-```env
-OLLAMA_BASE_URL=http://localhost:11434
-```
-
-and start Ollama manually with `ollama serve`.
-
-### `ConnectionRefusedError` when connecting to Ollama
-
-Ollama is not running. Start it:
-
-```bash
-ollama serve     # foreground, or
-ollama start     # background (macOS)
-```
-
-### Models not found after bootstrap
-
-Pull manually:
-
-```bash
-ollama pull codellama:7b
-ollama pull nomic-embed-text
-```
-
-### `prompt_toolkit` or `rich` import errors
-
-Ensure your virtualenv is activated:
-
-```bash
-# Windows
-.venv\Scripts\Activate.ps1
-
-# Linux / macOS
-source .venv/bin/activate
-
 pip install -r requirements.txt
 ```
 
-### PowerShell execution policy error
+4. Run the bootstrap (first run):
+
+```bash
+sentinel --project /path/to/your/project
+```
+
+During bootstrap Sentinel will:
+
+- Detect hardware and choose a hardware profile
+- Create a private virtualenv under the project folder if required
+- Install missing Python packages
+- Install or validate Ollama presence and optionally install models
+
+```mermaid
+flowchart LR
+  Clone["git clone"] --> Venv["create venv"]
+  Venv --> InstallDeps["pip install -r requirements.txt"]
+  InstallDeps --> Bootstrap["sentinel --project ... (bootstrap)"]
+  Bootstrap --> Ollama["Ollama installed? -> install/prompt"]
+  Bootstrap --> Models["Pull required models (optional)"]
+```
+
+---
+
+## 3. Windows quick start (detailed)
+
+1. Open PowerShell as Administrator (for system-wide runtime installations) or standard user for per-user installs.
+
+2. Clone repository and add to PATH or call `python main.py` directly.
+
+3. Recommended PowerShell commands:
+
+```powershell
+# Clone
+git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
+cd Local-LLM-Coding-Assistant
+
+# Create venv & activate
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# Install deps
+pip install -r requirements.txt
+
+# Run sentinel
+sentinel --project C:\path\to\repo
+```
+
+Notes:
+
+- If `ollama` is not installed, the bootstrap may attempt to install it via `winget` or prompt you to install manually.
+- Set PowerShell execution policy if scripts are blocked: `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
+
+---
+
+## 4. Linux / macOS quick start (detailed)
+
+```bash
+# Clone
+git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
+cd Local-LLM-Coding-Assistant
+
+# Create venv & activate
+python -m venv .venv
+source .venv/bin/activate
+
+# Install
+pip install -r requirements.txt
+
+# Optional: make sentinel script executable and symlink
+chmod +x sentinel
+sudo ln -s "$(pwd)/sentinel" /usr/local/bin/sentinel
+
+# Run
+sentinel --project ~/work/my-project
+```
+
+---
+
+## 5. Ollama setup and model management
+
+Install Ollama:
+
+- Windows: download installer from https://ollama.ai/download and run it
+- macOS: `brew install ollama`
+- Linux: `curl -fsSL https://ollama.ai/install.sh | sh`
+
+Verify Ollama is running:
+
+```bash
+ollama serve &
+ollama list
+curl http://localhost:11434/api/tags
+```
+
+Pull models (examples):
+
+```bash
+# Minimal
+ollama pull codellama:7b
+ollama pull nomic-embed-text
+
+# Standard
+ollama pull codellama:13b
+ollama pull mixtral:8x7b
+
+# Advanced
+ollama pull codellama:34b
+```
+
+Model selection is also configurable via `--hw-mode`.
+
+---
+
+## 6. Environment variables and configuration
+
+Copy `.env.example` to `.env` and edit as required. Important settings:
+
+- `SENTINEL_HOME` — where session and index files are stored
+- `OLLAMA_BASE_URL` — Ollama endpoint
+- `SENTINEL_EMBEDDING_MODEL` — embedding model tag
+- `SENTINEL_TOKEN_BUDGET` — per-step token budget
+
+---
+
+## 7. Offline / air-gapped installation
+
+1. On an internet-connected machine, pull required Ollama models and copy `~/.ollama/models/`.
+2. Use `pip download -r requirements.txt -d ./packages` to gather wheels.
+3. Transfer `packages/` and `~/.ollama/models/` to the air-gapped target and install with `pip install --no-index --find-links=./packages -r requirements.txt`.
+
+<details>
+<summary>Advanced: offline bootstrap checklist</summary>
+
+1. On an internet-connected machine, pull required Ollama models (`ollama pull ...`) and copy `~/.ollama/models/`.
+2. Use `pip download -r requirements.txt -d ./packages` to gather wheels.
+3. Transfer `packages/` and `~/.ollama/models/` to the air-gapped target and install with `pip install --no-index --find-links=./packages -r requirements.txt`.
+4. Run `sentinel --no-bootstrap` to skip network checks.
+
+</details>
+Use `sentinel --no-bootstrap` to skip network checks on first run.
+
+---
+
+## 8. GPU specifics
+
+## 8. GPU specifics
+
+This section describes common GPU setups and verification steps. Sentinel relies on Ollama to access GPU resources; ensure your system-level drivers and runtimes are correctly installed before running heavy models.
+
+### NVIDIA (recommended for heavy models)
+
+1. Install the appropriate NVIDIA driver for your GPU and OS (use the vendor installer or your package manager).
+2. Install CUDA toolkit if required by your runtime (match driver and CUDA versions).
+3. Verify access with:
+
+```bash
+nvidia-smi
+```
+
+4. Confirm Ollama sees the GPU by running a small model and watching VRAM usage:
+
+```bash
+ollama run codellama:7b "hello"
+```
+
+If the run shows GPU/VRAM usage, Ollama is using the device.
+
+### AMD (ROCm) — Linux only
+
+- Install ROCm following AMD instructions for your distribution. Verify `rocminfo` and `rocm-smi` where available.
+- Ollama uses system GPU support; consult Ollama docs for any additional flags required by ROCm.
+
+### Apple Silicon (Metal)
+
+- Ollama uses Metal on Apple Silicon automatically; ensure macOS is up to date and Ollama is installed via Homebrew or the official installer.
+
+---
+
+## 9. Troubleshooting & diagnostics
+
+This section provides diagnostic steps and common fixes for installation and runtime problems.
+
+### Basic checks
+
+- `ollama: command not found` — install Ollama or set `OLLAMA_BASE_URL` to a running server and ensure it is reachable.
+- `ConnectionRefusedError` — start Ollama in the background: `ollama serve` and verify `curl http://localhost:11434/api/tags` returns JSON.
+- Model pull failures — check disk space, network access, and retry `ollama pull <model>`; use a wired connection or VPN if required.
+- Python import errors — ensure the venv is active and `pip install -r requirements.txt` completed successfully.
+
+### Logs and diagnostics
+
+- Sentinel writes bootstrap and runtime logs to the console and may create diagnostic files under `~/.sentinel/` (or the directory set by `SENTINEL_HOME`).
+- If you encounter persistent issues, collect:
+
+  - `python main.py --debug ...` output (or run the command you used to reproduce)
+  - `ollama list` and `ollama logs` output
+  - system output from `nvidia-smi` / `rocminfo` (if applicable)
+
+Attach these to an issue when seeking help.
+
+### PowerShell notes (Windows)
+
+- If PowerShell blocks scripts, run as Administrator and set:
 
 ```powershell
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 
-### Low RAM — Sentinel chooses the wrong mode
+---
 
-Force a specific mode:
+---
 
-```bash
-sentinel --hw-mode minimal
-```
+## 9. Troubleshooting & diagnostics
 
-### Session data location
+- `ollama: command not found` — install Ollama or set `OLLAMA_BASE_URL` to a running server.
+- ConnectionRefusedError — start Ollama: `ollama serve`.
+- Missing models — pull manually with `ollama pull`.
+- Python import errors — activate the venv and run `pip install -r requirements.txt`.
 
-All session files, metrics, and indexes are stored under:
-- Windows: `%USERPROFILE%\.sentinel\`
-- Linux / macOS: `~/.sentinel/`
-
-Override with the `SENTINEL_HOME` environment variable.
+If you require guided support, open an issue with `diagnostics.txt` from `~/.sentinel/` and a short description of reproduction steps.

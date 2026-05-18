@@ -12,6 +12,11 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, List, Optional
 
+# Sentinel objects for the render-queue state machine.
+# Identity-compared with ``is`` — never equal to a callable.
+NEED_INPUT   = object()   # backend → main: approval input needed
+BACKEND_DONE = object()   # backend → main: pipeline finished
+
 # BUG-4 fix: Rich is an optional dependency.  If it is not installed the
 # entire module still imports and every method degrades gracefully to a
 # no-op.  All failure paths ensure self._progress_tracker is explicitly
@@ -84,7 +89,11 @@ class ProgressTracker:
             self._decomp_tree_live: Optional[Any] = None
             self._decomp_root_label: str = ""
             self._render_queue: Optional[Any] = None
-            self._render_thread: Optional[Any] = None
+            self._console_lock = None
+            self._backend_active = None
+            self._deferred_frontend = []
+            self._response_queue = None
+            self._pending_approval_panel = None
             return
 
         try:
@@ -101,7 +110,11 @@ class ProgressTracker:
             self._decomp_tree_live = None
             self._decomp_root_label = ""
             self._render_queue = None
-            self._render_thread = None
+            self._console_lock = None
+            self._backend_active = None
+            self._deferred_frontend = []
+            self._response_queue = None
+            self._pending_approval_panel = None
             return
 
         self._progress: Optional[Progress] = None
@@ -115,33 +128,51 @@ class ProgressTracker:
         self._decomp_rich_tree: Optional[Any] = None
         self._decomp_tree_live: Optional[Any] = None
         self._decomp_root_label: str = ""
-        # Daemon render thread
+        # Render queue — drained by the main thread in RENDER state.
         self._render_queue: "queue.SimpleQueue[Any]" = queue.SimpleQueue()
-        self._render_thread: threading.Thread = threading.Thread(
-            target=self._render_loop, daemon=True, name="pt-render"
-        )
-        self._render_thread.start()
+        # Lock serialising Live.stop()/start() against concurrent _enqueue() calls.
+        self._console_lock: threading.Lock = threading.Lock()
+        # While set, _drain_one() defers callables instead of dispatching them.
+        self._backend_active: threading.Event = threading.Event()
+        # Callables deferred during an approval window; replayed after Lives restart.
+        self._deferred_frontend: List[Any] = []
+        # Carries the user's approval answer from main thread back to backend thread.
+        self._response_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+        # Holds the approval Panel between the backend (builder) and main (printer).
+        self._pending_approval_panel: Any = None
 
     # ------------------------------------------------------------------
     # Daemon render thread
     # ------------------------------------------------------------------
 
-    def _render_loop(self) -> None:
-        """Dequeue and execute rendering callables until sentinel ``None``."""
-        while True:
-            fn = self._render_queue.get()
-            if fn is None:
-                break
-            try:
-                fn()
-            except Exception:
-                pass
+    def _drain_one(self) -> Any:
+        """Dequeue and execute one render callable (called by main thread).
+
+        Blocks on the render queue until an item is available. Returns the
+        raw item so the caller can detect ``NEED_INPUT`` and ``BACKEND_DONE``
+        sentinels. Regular callables are dispatched under ``_console_lock``
+        unless deferred by ``_backend_active``.
+        """
+        item = self._render_queue.get()
+
+        if item is NEED_INPUT or item is BACKEND_DONE:
+            return item  # caller handles state transitions
+
+        if self._backend_active.is_set():
+            self._deferred_frontend.append(item)
+        else:
+            with self._console_lock:
+                try:
+                    item()
+                except Exception:
+                    pass
+
+        return item
 
     def _enqueue(self, fn: Any) -> None:
-        """Submit a rendering callable to the daemon render thread.
+        """Submit a rendering callable to the main thread's render queue.
 
-        No-ops silently when the render queue is unavailable (Rich absent or
-        constructor failed).
+        Thread-safe. No-ops silently when the render queue is unavailable.
         """
         if self._render_queue is not None:
             try:
@@ -149,41 +180,15 @@ class ProgressTracker:
             except Exception:
                 pass
 
-    def _flush(self) -> None:
-        """Block until all enqueued render operations complete.
-
-        Enqueues a ``threading.Event`` sentinel behind all pending work and
-        waits for it, with a 5-second safety timeout.
-        """
-        if self._render_queue is not None:
-            try:
-                done = threading.Event()
-                self._render_queue.put(lambda: done.set())
-                done.wait(timeout=5.0)
-            except Exception:
-                pass
-
     def print(self, renderable: Any) -> None:
-        """Enqueue a renderable for display on the daemon render thread.
+        """Enqueue a renderable for display via the main thread's render loop.
 
         External callers (e.g. ``tree_execution_engine``) must use this
-        method instead of accessing ``self.console.print()`` directly, so
-        that all terminal output is serialised through the render thread.
+        method instead of accessing ``self.console.print()`` directly so
+        that all terminal output is serialised through the render queue.
         """
         if self.console is not None:
             self._enqueue(lambda r=renderable: self.console.print(r))
-
-    def shutdown(self) -> None:
-        """Send the sentinel value to stop the daemon render thread cleanly.
-
-        Optional — the daemon thread is reaped automatically when the process
-        exits. Call this for an orderly shutdown in test or REPL contexts.
-        """
-        if self._render_queue is not None:
-            try:
-                self._render_queue.put(None)
-            except Exception:
-                pass
 
     # Pipeline-level progress
     # ------------------------------------------------------------------
@@ -262,41 +267,33 @@ class ProgressTracker:
                 tracker.console.print(approval_panel)
                 answer = input("Apply? [Y/n] › ")
         """
-        # Drain all in-flight render-queue operations before touching either
-        # Live display.  Without this a queued refresh could fire between
-        # stop() and the print/input calls below.
-        self._flush()
+        self._backend_active.set()
 
-        # ── Stop pipeline progress Live ──────────────────────────────────────
-        pipeline_was_running = (
-            self._live is not None
-            and getattr(self._live, "is_started", False)
-        )
-        if pipeline_was_running:
-            self._live.stop()
+        with self._console_lock:
+            pipeline_was_running = (
+                self._live is not None
+                and getattr(self._live, "is_started", False)
+            )
+            if pipeline_was_running:
+                self._live.stop()
 
-        # ── Stop decomposition tree Live ─────────────────────────────────────
-        decomp_was_running = (
-            self._decomp_tree_live is not None
-            and getattr(self._decomp_tree_live, "is_started", False)
-        )
-        if decomp_was_running:
-            try:
-                self._decomp_tree_live.stop()
-            except Exception:
-                pass
+            decomp_was_running = (
+                self._decomp_tree_live is not None
+                and getattr(self._decomp_tree_live, "is_started", False)
+            )
+            if decomp_was_running:
+                try:
+                    self._decomp_tree_live.stop()
+                except Exception:
+                    pass
 
         try:
             yield
+
         finally:
-            # ── Resume decomposition tree Live first ─────────────────────────
-            # Restart the decomp tree before the pipeline progress bar so the
-            # z-order (tree above pipeline) is preserved in the terminal.
             if decomp_was_running and self._decomp_rich_tree is not None:
                 try:
-                    from rich.live import Live
-                    from rich.panel import Panel as _Panel
-                    _panel = _Panel(
+                    _panel = Panel(
                         self._decomp_rich_tree,
                         title="Decomposition Tree",
                         border_style="cyan",
@@ -305,23 +302,29 @@ class ProgressTracker:
                     self._decomp_tree_live = Live(
                         _panel,
                         console=self.console,
-                        auto_refresh=True,
-                        refresh_per_second=2,
+                        auto_refresh=False,
                         transient=False,
                     )
                     self._decomp_tree_live.start()
                 except Exception:
                     pass
 
-            # ── Resume pipeline progress Live ────────────────────────────────
             if pipeline_was_running and self._progress is not None:
                 try:
                     self._live = Live(
-                        self._progress, console=self.console, refresh_per_second=10
+                        self._progress,
+                        console=self.console,
+                        refresh_per_second=10,
                     )
                     self._live.start()
                 except Exception:
                     pass
+
+            for fn in self._deferred_frontend:
+                self._render_queue.put(fn)
+            self._deferred_frontend.clear()
+
+            self._backend_active.clear()
 
     # ------------------------------------------------------------------
     # Step-level updates
@@ -363,12 +366,20 @@ class ProgressTracker:
         Live context so the final tree state is flushed to the terminal.
         Must be called once after tree execution completes.
         """
-        self._flush()
         if self._decomp_tree_live is not None:
+            _lock = self._console_lock
             try:
+                if _lock is not None:
+                    _lock.acquire()
                 self._decomp_tree_live.stop()
             except Exception:  # pragma: no cover
                 pass
+            finally:
+                if _lock is not None:
+                    try:
+                        _lock.release()
+                    except RuntimeError:
+                        pass
             self._decomp_tree_live = None
             self._decomp_rich_tree = None
 
@@ -658,8 +669,7 @@ class ProgressTracker:
                 self._decomp_tree_live = Live(
                     panel,
                     console=self.console,
-                    auto_refresh=True,
-                    refresh_per_second=2,
+                    auto_refresh=False,
                     transient=False,
                 )
                 self._decomp_tree_live.start()
@@ -677,9 +687,12 @@ class ProgressTracker:
                     expand=True,
                 )
                 _p = panel  # capture before enqueue to avoid late-binding
-                def _do_refresh() -> None:
-                    self._decomp_tree_live.update(_p)
-                    self._decomp_tree_live.refresh()
+                def _do_refresh(_panel_ref: Any = _p) -> None:
+                    # Called by _drain_one() under _console_lock.
+                    # auto_refresh=False so this is the only refresh path.
+                    if self._decomp_tree_live is not None:
+                        self._decomp_tree_live.update(_panel_ref)
+                        self._decomp_tree_live.refresh()
                 self._enqueue(_do_refresh)
 
             # ── register nodes for live status tracking ───────────────────────

@@ -323,6 +323,7 @@ class SentinelRuntime:
             on_progress=lambda e: None,
             require_approval=True,
             context_builder=self._context_builder,
+            console=console,
         )
 
         # Attach async supervisor watchdog (creates SupervisorBus + daemon thread).
@@ -591,12 +592,15 @@ class SentinelRuntime:
                     pre_segregated=_pre_seg,
                 )
 
-                # Display tree structure in CLI before execution
+                # Display tree structure in CLI before execution.
+                # Re-use the shared tracker from the UI so the decomp tree
+                # Live and the pipeline Live share one Console and one
+                # render queue — eliminating the multiple-Console race.
                 try:
-                    from cli.progress_tracker import ProgressTracker as _PT
-                    _pt = _PT()
-                    _pt.display_tree(_tree)
-                    self._tree_engine._tracker = _pt
+                    _shared_tracker = getattr(self, "_shared_tracker", None)
+                    if _shared_tracker is not None:
+                        _shared_tracker.display_tree(_tree)
+                        self._tree_engine._tracker = _shared_tracker
                 except Exception:
                     pass
 
@@ -2171,6 +2175,9 @@ def main() -> None:
     ui = mods["InteractiveUI"](session=session)
     ui._handle_task = runtime.make_task_handler(session)
     ui._runtime = runtime  # allow commands like /models to query runtime state
+    # Share the UI's ProgressTracker with the runtime so the decomp tree
+    # Live and pipeline Live always use the same Console and render queue.
+    runtime._shared_tracker = ui.progress
 
     # Store hardware mode in session metadata for /session and /mode commands.
     if runtime._model_router:

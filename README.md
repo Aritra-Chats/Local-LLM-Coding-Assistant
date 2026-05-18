@@ -1,229 +1,107 @@
-<div align="center">
 
-<h1>🛡️ Sentinel</h1>
-<p><strong>Local Autonomous Development Assistant</strong></p>
-<p>Powered entirely by <a href="https://ollama.ai">Ollama</a> — no cloud, no API keys, no data sent off your machine.</p>
 
-![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python&logoColor=white)
-![Ollama](https://img.shields.io/badge/Ollama-required-black?logo=llama&logoColor=white)
-![License: MIT](https://img.shields.io/badge/License-MIT-green)
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
+# Local-LLM-Coding-Assistant (Sentinel)
 
-</div>
+Local-LLM-Coding-Assistant ("Sentinel") is a local-first, extensible framework for building developer-facing assistants powered by locally-hosted large language models (primarily via Ollama). Sentinel provides modular orchestration, specialized agents, a dynamic pipeline execution engine, and schema-driven tools for safe, auditable repository edits and developer workflows.
 
----
+## Purpose and audience
 
-## What is Sentinel?
+- Purpose: enable reproducible, auditable developer automation driven by local LLMs.
+- Audience: contributors, maintainers, and teams that want a local assistant for code generation, debugging, research, and repository-aware automation.
 
-Sentinel is a fully local, autonomous AI coding assistant that runs on your own hardware using [Ollama](https://ollama.ai) language models. It understands natural-language development tasks, decomposes them into structured pipelines, routes each step to the appropriate specialist agent, and executes them using a rich toolkit — all without sending a single byte to an external service.
+## At a glance
 
-**Key properties:**
-- **100% local** — all inference runs on your machine via Ollama
-- **Hardware-aware** — automatically selects models and parallelism for your CPU/GPU
-- **Self-improving** — tracks performance metrics and adapts pipeline strategies over time
-- **Session-persistent** — save and resume work across multiple conversations
-- **Extensible** — add new agents, tools, or models without touching core logic
+- Local-first: default integrations target Ollama to reduce external data exposure.
+- Auditable: pipelines, agent actions, and tool invocations are structured for traceability.
+- Extensible: add agents, tools, and model adapters with clear extension points.
 
----
+## Table of contents
 
-## Architecture Summary
+- [Prerequisites](#prerequisites)
+- [Quickstart (developer)](#quickstart-developer)
+- [Development workflow](#development-workflow)
+- [Where to look next](#where-to-look-next)
 
-```mermaid
-%%{init: {'theme': 'neutral', 'flowchart': {'curve': 'basis'}}}%%
-flowchart TD
-    A[User Prompt] --> B[Supervisor]
-    B --> C[Task Planner]
-    C --> D[Execution Plan]
-    D --> E[Pipeline Generator]
-    E --> F[Execution Engine]
-    F --> G[Agent Registry]
-    F --> H[Tool Registry]
-    F --> I[Context Builder]
-    F --> J[Model Router]
-    F --> K[Learning System]
-    K --> E
-
-    classDef core fill:#e8f1ff,stroke:#1f4b99,color:#0f2c63,stroke-width:1px;
-    classDef exec fill:#e9f8ef,stroke:#1f7a45,color:#0d4d2a,stroke-width:1px;
-    classDef infra fill:#fff5e8,stroke:#8a5a00,color:#5a3b00,stroke-width:1px;
-
-    class B,C,D,E core;
-    class F,G,H exec;
-    class I,J,K infra;
-```
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed breakdown of every subsystem.
-
----
-
-## Hardware Requirements
-
-| Mode | RAM | GPU VRAM | Coding Model | Reasoning Model | Concurrency |
-|---|---|---|---|---|---|
-| **Minimal** | 8–12 GB | None required | `codellama:7b` | `mistral:7b` | 1 (sequential) |
-| **Standard** | 12–20 GB | < 6 GB or none | `codellama:13b` | `mixtral:8x7b` | 2 |
-| **Advanced** | ≥ 20 GB or GPU ≥ 6 GB VRAM | Optional | `codellama:34b` | `mixtral:8x7b` | 4 |
-
-Sentinel automatically detects your hardware and selects the appropriate mode. You can override with `--hw-mode`.
-
-On first launch, use the arrow keys to choose ONLINE or OFFLINE mode.
-
-**Embedding model** (all modes): `nomic-embed-text`
-
----
-
-## Supported Models
-
-Any Ollama-compatible model can be used. The recommended defaults per mode:
-
-| Purpose | Minimal | Standard | Advanced |
-|---|---|---|---|
-| Code generation | `codellama:7b` | `codellama:13b` | `codellama:34b` |
-| Reasoning / planning | `mistral:7b` | `mixtral:8x7b` | `mixtral:8x7b` |
-| Embeddings | `nomic-embed-text` | `nomic-embed-text` | `nomic-embed-text` |
-
-Alternatives that work well: `deepseek-coder`, `qwen2.5-coder`, `llama3`, `phi3`, `gemma2`.
-
----
-
-## Installation
-
-### Prerequisites
+## Prerequisites
 
 - Python 3.11 or later
-- [Ollama](https://ollama.ai/download) installed and running
-- Git (optional, for git-related tools)
+- Ollama (recommended) for local inference
+- Git (for contributing)
 
-# 2. Quick install
+## Quickstart (developer)
+
+1. Clone and enter the repo:
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/Aritra-Chats/Local-LLM-Coding-Assistant.git
+git clone https://github.com/your-org/Local-LLM-Coding-Assistant.git
 cd Local-LLM-Coding-Assistant
-
-# 2. Add this folder to your PATH, then open a new PowerShell window
-
-# 3. Start Sentinel (bootstraps automatically on first run)
-sentinel
 ```
 
-On macOS / Linux make the `sentinel` script executable and add it to your PATH:
+2. Create and activate a virtual environment:
 
 ```bash
-chmod +x sentinel
-sudo ln -s "$(pwd)/sentinel" /usr/local/bin/sentinel
+python -m venv .venv
+source .venv/bin/activate    # macOS / Linux
+.venv\Scripts\Activate.ps1  # Windows PowerShell
+pip install -r requirements.txt
 ```
 
-If you are already inside the repository root and want a direct launch, `python main.py` still works. If you add the Sentinel folder to PATH, PowerShell can launch `sentinel` from any directory because `sentinel.bat` lives in that folder and calls `main.py` directly.
-
-On first launch, Sentinel will:
-1. Detect your hardware and select an appropriate mode
-2. Install any missing Python packages
-3. Pull only the models needed for the selected launch mode
-4. Create workspace directories under `~/.sentinel/`
-
-When you choose ONLINE mode, Sentinel only pulls the supervisor/reasoning model and the embedding model. When you choose OFFLINE mode, it also pulls the local coding model used for local execution.
-
-See [INSTALLATION.md](INSTALLATION.md) for detailed setup instructions including offline installation and troubleshooting.
-
----
-
-## CLI Examples
+3. Run the project (development):
 
 ```bash
-# Start a new session
-sentinel
-
-# Resume a previous session
-sentinel --resume 5f63c8db-7f49-4fa4-a42f-6d53ec2d4b5f
-
-# Target a specific project directory
-sentinel --project C:\code\my-api
-
-# Force a hardware mode
-sentinel --hw-mode minimal
-
-# Skip the bootstrap check (faster startup after first run)
-sentinel --no-bootstrap
-
-# Force online or offline routing without the startup prompt
-sentinel --online
-sentinel --offline
-
-# PowerShell check: confirm the command is available on PATH
-Get-Command sentinel
+python main.py
 ```
 
-### Slash commands inside the REPL
+4. Run tests:
 
-| Command | Description |
-|---|---|
-| `/help` | List all available commands |
-| `/status` | Show current session and system status |
-| `/pipeline` | Show the current pipeline as a table |
-| `/models` | List available local Ollama models |
-| `/session` | Display current session info |
-| `/resume <id>` | Load a previous session |
-| `/context` | Show what the context engine has assembled |
-| `/index` | Rebuild the current project index |
-| `/syscheck` | Run hardware and dependency checks |
-| `/tasks` | List user tasks in the current session |
-| `/mode <mode>` | Switch hardware mode for the current session |
-| `/diff` | Show the diff of the last file edit |
-| `/clear` | Clear the terminal |
-| `/exit` | Save session and exit |
-
-### Example task prompts
-
-```
-sentinel › Write a FastAPI endpoint that validates a JWT and returns the user profile
-sentinel › Debug the failing tests in tests/test_auth.py
-sentinel › Refactor src/database.py to use async SQLAlchemy
-sentinel › Add GitHub Actions CI for a Python project
-sentinel › Explain the dependency graph of this project
+```bash
+pytest -q
 ```
 
----
+## Development workflow
 
-## Project Structure
+- Branching: create topic branches using `feature/<short-desc>` or `fix/<short-desc>`.
+- Commit messages: use conventional styles (`feat:`, `fix:`, `docs:`, `chore:`).
+- Code style: run `black`, `ruff`, and `isort` before opening a PR.
+- Tests: add or update tests that cover behavior changes.
 
-```
-local-llm-assistant/
-├── agents/          Supervisor, planner, pipeline generator + 6 specialist agents
-├── cli/             Interactive REPL, display helpers, diff viewer, command palette
-├── config/          Hardware profile, model catalogue, runtime settings
-├── context/         RAG search, symbol graph, dependency graph, attachment loader
-├── core/            Bootstrap, execution engine, model router, validator
-├── execution/       Dynamic pipeline generation, step runner, retry, sandbox
-├── learning/        Metrics tracker, pipeline optimiser, prompt A/B engine
-├── memory/          Session store, conversation memory, project index
-├── models/          Ollama client, embedding client, model registry
-├── system/          Hardware detector, dependency installer, Ollama manager
-├── tasks/           Task planner, classifier, schema definitions
-├── tools/           12 built-in tools: read/write, search, shell, git, web, …
-├── tests/           Test suite skeleton
-├── main.py          Entry point & runtime orchestrator
-├── sentinel.bat     Windows launcher for PATH-based use
-├── pyproject.toml
-└── requirements.txt
-```
+### PR checklist
 
----
+- [ ] Branch follows naming convention
+- [ ] Tests added/updated and pass locally
+- [ ] Linting and formatting applied
+- [ ] Documentation updated if public APIs changed
 
-## Documentation
+## Where to look next
 
-| Document | Description |
-|---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Deep-dive into every subsystem |
-| [INSTALLATION.md](INSTALLATION.md) | Detailed setup, offline install, troubleshooting |
-| [USAGE.md](USAGE.md) | Complete CLI reference and workflow guide |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute code, tests, and documentation |
-| [ROADMAP.md](ROADMAP.md) | Planned features and release milestones |
-| [SECURITY.md](SECURITY.md) | Security policy and vulnerability reporting |
-| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community standards |
+- Architecture overview: [ARCHITECTURE.md](ARCHITECTURE.md)
+- Installation and bootstrap: [INSTALLATION.md](INSTALLATION.md)
+- Contribution process: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Usage examples: [USAGE.md](USAGE.md)
 
----
+## Support & communication
+
+Open issues for bugs and feature requests. For sensitive reports (security or abuse), use the address referenced in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for full text.
+See the repository `LICENSE` file for terms and attribution.
+
+---
+
+## Project structure (quick reference)
+
+This list helps contributors find implementation locations quickly:
+
+- `main.py` — CLI entrypoint and bootstrap
+- `agents/` — agent implementations (coding_agent.py, debugging_agent.py, etc.)
+- `core/` — supervisor, model router, execution engine
+- `execution/` — pipeline types and step runner
+- `context/` — RAG, loaders, symbol graph
+- `models/` — Ollama clients and model adapters
+- `tools/` — file, git, shell tools
+- `memory/` — session and conversation persistence
+- `tests/` — unit and integration tests
+
+If you are contributing code, start by reading `CONTRIBUTING.md` and `ARCHITECTURE.md`.
+

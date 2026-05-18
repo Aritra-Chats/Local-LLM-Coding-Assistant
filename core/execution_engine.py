@@ -817,7 +817,7 @@ class ConcreteExecutionEngine(ExecutionEngine):
                     max_workers = min(len(parallel_group), 4)
                     with _cf.ThreadPoolExecutor(
                         max_workers=max_workers,
-                        thread_name_prefix="sentinel_step",
+                        thread_name_prefix=f"sentinel-{step.get('agent', 'step')}",
                     ) as pool:
                         futures = {pool.submit(_run_parallel_step, s): s for s in parallel_group}
                         for future in _cf.as_completed(futures):
@@ -1246,8 +1246,14 @@ class ConcreteExecutionEngine(ExecutionEngine):
                         # effective model tag for whichever tier succeeded,
                         # preventing a cloud model name from being sent to a
                         # local endpoint (which always fails with HTTP 404).
+                        _cloud_fallbacks = (
+                            _online_sel.get("cloud_fallback_list", [])
+                            if isinstance(_online_sel, dict) else []
+                        )
                         _probe_client, _effective_tag = self._resolve_with_fallback(
-                            _online_provider, _online_model_tag
+                            _online_provider,
+                            _online_model_tag,
+                            cloud_fallback_list=_cloud_fallbacks,
                         )
                         if _probe_client is not None:
                             step["_selected_model"] = _effective_tag
@@ -1461,7 +1467,10 @@ class ConcreteExecutionEngine(ExecutionEngine):
         return None
 
     def _resolve_with_fallback(
-        self, provider: str, model_tag: str
+        self,
+        provider: str,
+        model_tag: str,
+        cloud_fallback_list: Optional[List[str]] = None,
     ) -> "tuple[Optional[Any], str]":
         """Resolve an inference client with automatic provider fallback.
 
@@ -1493,14 +1502,32 @@ class ConcreteExecutionEngine(ExecutionEngine):
 
         # ── Tier 1: Ollama Cloud ─────────────────────────────────────────────
         if provider == "ollama_cloud":
+            # is_available() only checks API-key validity against /api/tags.
+            # is_model_available() makes a 1-token probe to /api/generate to
+            # verify the specific model is accessible on this plan tier.
+            # This catches 404 "tier-locked" responses before the real call.
             try:
                 from models.ollama_cloud_client import OllamaCloudClient
                 client = OllamaCloudClient(
                     api_key=os.environ.get("OLLAMA_API_KEY", "")
                 )
-                return client, model_tag
+                if client.is_model_available(model_tag):
+                    return client, model_tag
             except Exception:
-                pass  # missing API key or import failure → fall to tier 2
+                pass
+
+            # Primary tier-locked or unavailable — walk ranked fallback list.
+            for fallback_tag in (cloud_fallback_list or []):
+                try:
+                    from models.ollama_cloud_client import OllamaCloudClient
+                    fb_client = OllamaCloudClient(
+                        api_key=os.environ.get("OLLAMA_API_KEY", "")
+                    )
+                    if fb_client.is_model_available(fallback_tag):
+                        return fb_client, fallback_tag
+                except Exception:
+                    continue
+            # All cloud models exhausted → fall through to Tier 2
 
         # ── Tier 2: External provider ────────────────────────────────────────
         # When the original provider was "ollama_cloud" (and failed), try all
@@ -1566,8 +1593,12 @@ class ConcreteExecutionEngine(ExecutionEngine):
             try:
                 provider  = selected.get("provider", "ollama_local")
                 model_tag = selected.get("model", "")
+                _cloud_fallbacks = (
+                    selected.get("cloud_fallback_list", [])
+                    if isinstance(selected, dict) else []
+                )
                 client_obj, effective_tag = self._resolve_with_fallback(
-                    provider, model_tag
+                    provider, model_tag, cloud_fallback_list=_cloud_fallbacks
                 )
                 if client_obj is not None and hasattr(agent, "use_client"):
                     agent.use_client(client_obj)
@@ -1730,7 +1761,7 @@ class ConcreteExecutionEngine(ExecutionEngine):
         if advisor_tasks:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=len(advisor_tasks),
-                thread_name_prefix="council_advisor",
+                thread_name_prefix="sentinel-council",
             ) as pool:
                 futures = {
                     pool.submit(_run_agent, t): t for t in advisor_tasks
@@ -2618,19 +2649,13 @@ class ConcreteExecutionEngine(ExecutionEngine):
         - A (all, auto-approve) — approve this and all future approval
                                   requests in the current session
         """
-        # If session auto-approve is already enabled, skip prompt
         if self._auto_approve_session:
             return True
 
         try:
-            from contextlib import nullcontext
-            from rich.panel import Panel  # (was incorrectly "_Panel")
+            from rich.panel import Panel
+            from cli.progress_tracker import NEED_INPUT
 
-            # ── Console selection ─────────────────────────────────────────
-            # Always use the tracker's console when available so that output
-            # is routed through the same Rich Console instance that owns the
-            # Live display.  Creating a separate Console would desync Rich's
-            # internal line-counting and corrupt the re-drawn progress bars.
             tracker = self._progress_tracker
             con = (
                 tracker.console
@@ -2638,10 +2663,10 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 else self._console
             )
             if con is None:
-                from rich.console import Console as _FallbackConsole
-                con = _FallbackConsole()
+                from rich.console import Console as _FC
+                con = _FC()
 
-            # ── Build detail line ─────────────────────────────────────────
+            # ── Build detail line ────────────────────────────────────────
             if tool_name == "write_file":
                 detail = f"Write → [bold]{params.get('path', '?')}[/bold]"
             elif tool_name == "run_shell":
@@ -2669,47 +2694,37 @@ class ConcreteExecutionEngine(ExecutionEngine):
                 border_style="yellow",
             )
 
-            # ── Pause → prompt → resume ───────────────────────────────────
-            # paused_for_input() guarantees the Live refresh thread has
-            # fully stopped before we write anything, so the panel and the
-            # input prompt are never torn by a concurrent display refresh.
-            # The Live display is always resumed in the finally block —
-            # even if input() raises KeyboardInterrupt or EOFError.
-            pause_ctx = (
-                tracker.paused_for_input()
-                if tracker is not None
-                else nullcontext()
-            )
-
-            answer = ""
-            with pause_ctx:
+            if tracker is not None and tracker._render_queue is not None:
+                # ── Queue-based path: main thread handles input ───────────
+                # paused_for_input() stops Lives under _console_lock before
+                # we put NEED_INPUT in the queue, so the main thread finds
+                # a clean terminal when it dequeues and prints the panel.
+                with tracker.paused_for_input():
+                    tracker._pending_approval_panel = approval_panel
+                    tracker._render_queue.put(NEED_INPUT)
+                    try:
+                        answer = tracker._response_queue.get(timeout=300)
+                    except Exception:
+                        answer = "n"
+            else:
+                # ── Fallback: Rich unavailable, call input() directly ────
                 con.print(approval_panel)
                 try:
-                    # input() flushes stdout and handles the cursor correctly
-                    # on both Windows (conhost/WT) and Unix terminals.
                     answer = input("  Apply? [Y/n/A] › ").strip().lower()
                 except EOFError:
-                    # Non-interactive stdin (pipe, CI) — default deny so the
-                    # caller decides rather than silently proceeding.
                     answer = "n"
                 except KeyboardInterrupt:
                     con.print("\n[dim]Interrupted — treating as deny.[/dim]")
                     answer = "n"
 
-            # ── Evaluate answer ───────────────────────────────────────────
             if answer in ("a", "accept all", "auto-approve"):
                 self._auto_approve_session = True
                 return True
             return answer in ("", "y", "yes")
 
         except Exception as _approval_err:
-            # Something went wrong inside the Rich rendering path (broken
-            # console, import failure, etc.).  Never silently auto-approve in
-            # an interactive session — always give the user a chance to decide.
             import sys as _sys
             if _sys.stdin.isatty():
-                # Interactive session: fall back to a plain-text prompt so
-                # the approval is NEVER silently skipped for a real user.
                 try:
                     _sys.stdout.write(
                         f"\n[approval required — rich display failed: {_approval_err}]\n"
@@ -2723,12 +2738,8 @@ class ConcreteExecutionEngine(ExecutionEngine):
                         return True
                     return _raw in ("", "y", "yes")
                 except Exception:
-                    # stdin is completely broken — deny to be safe
                     return False
-            else:
-                # Non-interactive (CI, pipe) — auto-allow so pipelines
-                # are not silently blocked in headless environments.
-                return True
+            return False
 
     # ------------------------------------------------------------------
     # Tool invocation

@@ -1,498 +1,154 @@
-# Sentinel Architecture
 
-This document describes the internal design of every Sentinel subsystem. It is intended for contributors and developers who want to understand how the pieces fit together.
+# Architecture Overview
 
----
+This document describes the architecture of the Local-LLM-Coding-Assistant ("Sentinel"). It is written for contributors, maintainers, and integrators who need a detailed understanding of component responsibilities, data flows, runtime modes, and extension points.
 
-## Table of Contents
+## Table of contents
 
-1. [Design Principles](#1-design-principles)
-2. [Top-Level Structure](#2-top-level-structure)
-3. [Request Lifecycle](#3-request-lifecycle)
-4. [Agents Subsystem](#4-agents-subsystem)
-5. [Task Planning](#5-task-planning)
-6. [Pipeline Generator](#6-pipeline-generator)
-7. [Execution Engine](#7-execution-engine)
-8. [Context Engine](#8-context-engine)
-9. [Tool System](#9-tool-system)
-10. [Model Router](#10-model-router)
-11. [Learning System](#11-learning-system)
-12. [Memory & Session](#12-memory--session)
-13. [Hardware Profiler](#13-hardware-profiler)
-14. [CLI Layer](#14-cli-layer)
-15. [Bootstrap](#15-bootstrap)
-16. [Data Flow Diagram](#16-data-flow-diagram)
+- [High-level summary](#high-level-summary)
+- [Component details](#component-details)
+- [Data flows and lifecycle](#data-flows-and-lifecycle)
+- [Runtime modes](#runtime-modes)
+- [Extension points](#extension-points)
+- [Where to look in code](#where-to-look-in-code)
 
----
+## High-level summary
 
-## 1. Design Principles
+Sentinel is structured as a modular, pipeline-oriented orchestration system for local LLM-based developer tooling. The system separates concerns into the following major subsystems:
 
-| Principle | Implementation |
-|---|---|
-| **Local-first** | All inference via Ollama; no external API calls |
-| **Hardware-adaptive** | Three runtime modes (minimal / standard / advanced) selected automatically |
-| **Pipeline-oriented** | Every task becomes an explicit, inspectable JSON pipeline |
-| **ABC + concrete** | Each major component is defined as an ABC with one concrete implementation, making substitution trivial |
-| **Self-improving** | EMA-based metrics drive pipeline and prompt optimisation across sessions |
-| **Fail-safe** | Every step has retry budgets, fallback models, and supervisor recovery |
-
----
-
-## 2. Top-Level Structure
-
-```
-local-llm-assistant/
-├── agents/       ABC + concrete: supervisor, planner, pipeline generator + 7 specialists
-├── cli/          Interactive REPL, display, diff, command palette
-├── config/       Hardware profile, model config, environment settings
-├── context/      RAG engine, symbol graph, dependency graph, attachment loader
-├── core/         Bootstrap, execution engine, model router, validator
-├── execution/    Dynamic pipeline, step runner, retry handler, sandbox
-├── learning/     Metrics tracker, pipeline optimiser, prompt A/B engine
-├── memory/       Session store, conversation memory, project index
-├── models/       Ollama HTTP client, embedding client, model registry
-├── system/       Hardware detection, dependency installer, Ollama manager
-├── tasks/        Task planner, classifier, schema re-exports
-├── tools/        12 built-in tools + registry
-└── main.py       SentinelRuntime orchestrator + entry point; exposed as the sentinel console script via pyproject.toml
-```
-
----
-
-## 3. Request Lifecycle
-
-```
-User types a prompt
-        │
-        ▼
-InteractiveUI  ──────────────────────────────────────────────────
-        │  CommandParser intercepts /commands; passes tasks onward
-        ▼
-SentinelRuntime.process_prompt()
-        │
-        ├─► ConcreteSupervisorAgent.parse_prompt()
-        │       └─ classify goal, extract metadata
-        │
-        ├─► ConcretePlannerAgent (via supervisor.delegate())
-        │       └─ TaskPlanner: classify → decompose → ExecutionPlan
-        │
-        ├─► ConcretePipelineGeneratorAgent
-        │       └─ DynamicPipelineGenerator: plan → Pipeline JSON
-        │
-        ├─► LearningPipelineOptimizer.optimize()
-        │       └─ apply data-driven patches to pipeline steps
-        │
-        ├─► ConcreteExecutionEngine.run_pipeline()
-        │       └─ for each step:
-        │               ConcreteContextBuilder.build()
-        │               ConcreteModelRouter.select()
-        │               agent.run(step, context)
-        │               ToolRegistry.invoke(tool, params)
-        │               ProgressTracker update
-        │
-        └─► PerformanceTracker.record_pipeline_run()
-```
-
----
-
-## 4. Agents Subsystem
-
-**Package:** `agents/`
-
-### Class hierarchy
-
-```
-BaseAgent (ABC)  ──  agents/base_agent.py
-    ├── SupervisorAgent (ABC)          ──  agents/supervisor.py
-    │       └── ConcreteSupervisorAgent
-    ├── PlannerAgent (ABC)             ──  agents/planner.py
-    │       └── ConcretePlannerAgent
-    ├── PipelineGenerator (ABC)        ──  agents/pipeline_generator.py
-    │       └── ConcretePipelineGeneratorAgent
-    ├── CodingAgent                    ──  agents/coding_agent.py
-    ├── DebuggingAgent                 ──  agents/debugging_agent.py
-    ├── ReasoningAgent                 ──  agents/reasoning_agent.py
-    ├── DevOpsAgent                    ──  agents/devops_agent.py
-    ├── ResearchAgent                  ──  agents/research_agent.py
-    ├── SystemAgent                    ──  agents/system_agent.py
-    └── CriticAgent                    ──  agents/critic_agent.py
-```
-
-### `BaseAgent` interface
-
-```python
-run(step, context) -> Dict          # primary execution entry point
-validate_output(output) -> bool     # post-run sanity check
-handle_error(error, step) -> Dict   # per-agent error recovery
-describe() -> str                   # human-readable agent description
-```
-
-### Agent roles
-
-| Agent | Category | Responsibilities |
-|---|---|---|
-| `ConcreteSupervisorAgent` | orchestration | Parse prompts, delegate, monitor, recover |
-| `ConcretePlannerAgent` | planning | Decompose goals into subtasks, assign agents |
-| `ConcretePipelineGeneratorAgent` | planning | Convert `ExecutionPlan` → `Pipeline` |
-| `CodingAgent` | coding | Code generation, file editing |
-| `DebuggingAgent` | debugging | Error diagnosis, patch generation |
-| `ReasoningAgent` | reasoning | Analysis, explanation, comparison |
-| `DevOpsAgent` | devops | Git, CI/CD, shell commands |
-| `ResearchAgent` | research | Web search, documentation lookup |
-| `SystemAgent` | system | OS operations, application control |
-| `CriticAgent` | review | Senior-reviewer pass on write_file actions before dispatch |
-
-### `AgentAction`
-
-All agent outputs are expressed as `AgentAction` objects (`agents/agent_action.py`). Action types:
-
-```
-tool_call   — invoke a registered tool
-file_edit   — write or patch a file
-reasoning   — internal reasoning trace
-response    — final natural-language output
-clarify     — request clarification from user
-```
-
----
-
-## 5. Task Planning
-
-**Package:** `tasks/`
-
-### Pipeline
-
-```
-Raw prompt
-    │
-    ▼
-TaskClassifier.classify(goal) → TaskClassification
-    scores goal against weighted keyword sets for 6 categories:
-    reasoning · coding · debugging · research · devops · system
-    │
-    ▼
-SubtaskDecomposer.decompose(goal, classification) → List[Subtask]
-    applies per-category templates, assigns agents and tools per subtask
-    │
-    ▼
-ExecutionPlanGenerator.generate(goal, subtasks) → ExecutionPlan
-    adds dependency annotations, context hints, and complexity estimate
-    │
-    ▼
-TaskPlanner.plan(task) → ExecutionPlan   (public API)
-```
-
-### `ExecutionPlan` schema
-
-```json
-{
-  "plan_id": "<uuid>",
-  "goal": "<string>",
-  "category": "coding|debugging|reasoning|research|devops|system",
-  "complexity": "low|medium|high",
-  "subtasks": [
-    {
-      "subtask_id": "<uuid>",
-      "name": "<string>",
-      "agent": "<agent_name>",
-      "tools": ["<tool_name>"],
-      "context_hints": ["<hint>"],
-      "dependencies": ["<subtask_id>"]
-    }
-  ],
-  "estimated_steps": 5,
-  "created_at": "<ISO-8601>"
-}
-```
-
----
-
-## 6. Pipeline Generator
-
-**Package:** `execution/`  
-**Key file:** `execution/pipeline.py` (`DynamicPipelineGenerator`)
-
-Converts an `ExecutionPlan` into an executable `Pipeline` by:
-
-1. Mapping subtasks → `PipelineStep` objects
-2. Assigning model hints per-step based on hardware mode
-3. Applying retry budgets and timeout values
-4. Resolving dependency ordering
-5. Tagging steps eligible for council review (multi-agent voting)
-
-### Pipeline modes
-
-| Mode | Description |
-|---|---|
-| `solo` | Single agent handles each step |
-| `council` | High-stakes steps reviewed by multiple agents |
-
-### System modes (hardware-driven)
-
-| System Mode | Token budgets | Concurrency |
-|---|---|---|
-| `minimal` | 4096 | 1 |
-| `standard` | 8192 | 2 |
-| `advanced` | 16384 | 4 |
-
----
-
-## 7. Execution Engine
-
-**Package:** `core/`  
-**Key file:** `core/execution_engine.py`
-
-`ConcreteExecutionEngine` drives a `Pipeline` to completion:
-
-```
-for each step (respecting depends_on):
-    1. ConcreteContextBuilder.build(step)          → context payload
-    2. ConcreteModelRouter.select(step, context)   → model tag
-    3. agent.run(step, context)                    → AgentAction list
-    4. for action in actions:
-           if action.type == "tool_call":
-               ToolRegistry.invoke(tool, params)
-           if action.type == "file_edit":
-               write / patch file
-    5. ProgressTracker.complete_step(step_id)
-    6. if step failed: supervisor.recover(failure, state)
-```
-
-Returns a `PipelineRunResult` containing:
-- `status` — `completed | partial | failed`
-- `step_results` — list of `StepResult` per step
-- `total_elapsed_ms`
-- `failed_steps` count
-- `summary()` — human-readable outcome
-
----
-
-## 8. Context Engine
-
-**Package:** `context/`
-
-`ConcreteContextBuilder` assembles a token-efficient context payload for each pipeline step from multiple sources:
-
-| Source | Module | Content |
-|---|---|---|
-| RAG search | `context/rag_search.py` | Relevant code chunks from repository |
-| Symbol graph | `context/symbol_graph.py` | Class/function cross-references (AST-based) |
-| Dependency graph | `context/dependency_graph.py` | Module import relationships |
-| Project synopsis | `context/project_synopsis.py` | LLM-generated codebase summary (cached) |
-| Conversation memory | `memory/conversation_memory.py` | Recent turns from the current session |
-| Attachments | `context/context_loader.py` | `@file` / `@url` / `@image` / `@pdf` / `@snippet` tokens |
-
-The builder respects a per-profile **token budget** (`DEFAULT_TOKEN_BUDGET` in `config/settings.py`), ranking sources by relevance and truncating to fit.
-
----
-
-## 9. Tool System
-
-**Package:** `tools/`
-
-All tools extend `Tool` (base class in `tools/tool_registry.py`):
-
-```python
-class Tool:
-    name: str                              # registry key
-    description: str                       # shown in /help and to models
-    parameters_schema: Dict                # JSON Schema for input validation
-    def execute(self, params) -> ToolResult
-```
-
-### Built-in tools
-
-| Tool | Key | Description |
-|---|---|---|
-| `ReadFileTool` | `read_file` | Read file content with optional line range |
-| `WriteFileTool` | `write_file` | Write or overwrite a file |
-| `SearchCodeTool` | `search_code` | Regex or text search across a project |
-| `FindFilesTool` | `find_files` | Find files by glob pattern |
-| `RunShellTool` | `run_shell` | Execute a shell command |
-| `RunTestsTool` | `run_tests` | Run pytest / unittest and capture output |
-| `GitDiffTool` | `git_diff` | Show uncommitted changes |
-| `GitCommitTool` | `git_commit` | Stage and commit files |
-| `WebSearchTool` | `web_search` | DuckDuckGo search (no API key needed) |
-| `InstallDependencyTool` | `install_dependency` | pip install a package |
-| `OpenApplicationTool` | `open_application` | Open a URL or application |
-| `ProjectInitializerTool` | `project_initializer` | Scaffold new projects using framework generators |
-
-`ConcreteToolRegistry` wraps every invocation with:
-- JSON Schema input validation
-- Execution timing
-- Structured error capture (no exceptions escape)
-
----
-
-## 10. Model Router
-
-**Package:** `core/`  
-**Key file:** `core/model_router.py`
-
-`ConcreteModelRouter` selects the Ollama model for each pipeline step:
-
-1. Reads the `HardwareProfile` to know available model tier
-2. Consults step `model_hint` (set by the pipeline generator)
-3. Falls back to the profile's `recommended_model` if the hint is unavailable
-4. Records per-(model, category) latency via `PerformanceTracker`
-5. Degrades to smaller model if `PERFORMANCE_DEGRADED_THRESHOLD` is breached
-
-Exposes:
-- `select(step, context)` — returns model tag string
-- `select_coding_model()` — profile default for coding steps
-- `select_reasoning_model()` — profile default for reasoning steps
-- `fallback(model)` — returns next-smaller model in the tier
-
----
-
-## 11. Learning System
-
-**Package:** `learning/`
-
-Three components work together:
-
-### `PerformanceTracker` (`learning/metrics_tracker.py`)
-
-Tracks four metric families using exponential moving averages (α = 0.2):
-
-| Family | Key | Description |
-|---|---|---|
-| Pipeline success rate | `(category, mode)` | Pass/fail EMA per pipeline type |
-| Model latency | `(model, category)` | Latency EMA, first-token latency |
-| Edit acceptance | `(agent)` | User accept/reject rate per agent |
-| Tool reliability | `(tool)` | Success rate and consecutive-failure streak |
-
-Persists to `~/.sentinel/metrics/<session_id>.json`.
-
-### `LearningPipelineOptimizer` (`learning/feedback_loop.py`)
-
-Reads `PerformanceTracker` snapshots and patches open pipelines:
-- Increases retry budgets for unreliable tools
-- Swaps models on latency violations
-- Removes council overhead when solo performance is already high
-- Promotes high-reliability tools to front of step tool lists
-
-### `PromptOptimizer` (`learning/prompt_optimizer.py`)
-
-A/B tests prompt variants per `(agent, category)` pair:
-- Maintains `PromptTemplate` objects with multiple `PromptVariant` entries
-- Scores variants by weighted combination of acceptance rate, success rate, and speed
-- Surfaces suggestions when variant count reaches `MIN_OBSERVATIONS = 20`
-
----
-
-## 12. Memory & Session
-
-**Package:** `memory/`
-
-### `SessionManager` (`memory/session_store.py`)
-
-Manages a single session lifecycle:
-- `start()` — create or resume a session
-- `add_turn(role, content)` — append a conversation turn
-- `save()` — persist to `~/.sentinel/sessions/<session_id>.json`
-- `pipeline_state` — dict updated after each pipeline run
-
-Sessions are stored as JSON files and survive restarts.
-
-### `ConversationMemory` (`memory/conversation_memory.py`)
-
-In-process ring buffer (default 200 turns) of conversation history. Used by `ConcreteContextBuilder` as a context source.
-
-### `ProjectIndex` (`memory/project_index.py`)
-
-File tree index for fast path search. Rebuilt on demand; persisted to `~/.sentinel/index/`.
-
----
-
-## 13. Hardware Profiler
-
-**Package:** `config/` + `system/`
-
-```
-system/hardware_detector.py  ─►  SystemCheck.run() → SystemInfo
-                                      RAM, CPU count, GPU list,
-                                      CUDA/ROCm/Metal flags, VRAM
-
-config/hardware_profile.py   ─►  HardwareProfiler.classify(info) → HardwareProfile
-                                      mode (minimal/standard/advanced)
-                                      recommended_model, context_limit,
-                                      max_pipeline_concurrency,
-                                      embedding_model, reasoning_model
-```
-
-### Classification thresholds
-
-| Mode | RAM | GPU |
-|---|---|---|
-| Minimal | < 12 GB | No qualifying GPU |
-| Standard | 12–20 GB | GPU < 6 GB VRAM, or none |
-| Advanced | ≥ 20 GB, OR CUDA/ROCm GPU ≥ 6 GB VRAM, OR Apple Metal | Any |
-
----
-
-## 14. CLI Layer
-
-**Package:** `cli/`
-
-| Module | Class/Function | Role |
-|---|---|---|
-| `cli/interface.py` | `InteractiveUI` | Main REPL loop using `prompt_toolkit` |
-| `cli/interface.py` | `launch()`, `main()` | Entry-point helpers |
-| `cli/pipeline_viewer.py` | `PipelineViewer` | Rich tree/table rendering of pipeline steps |
-| `cli/progress_tracker.py` | `ProgressTracker` | Rich Live progress bar during execution |
-| `cli/display.py` | re-export shim | Backward-compat re-export of `PipelineViewer` and `ProgressTracker` |
-| `cli/command_palette.py` | `CommandParser` | Slash-command registration and dispatch |
-| `cli/diff_viewer.py` | `DiffViewer` | Syntax-highlighted unified diff output |
-
-`InteractiveUI` exposes a `_handle_task` hook that `SentinelRuntime.make_task_handler()` wires to the full pipeline at startup.
-
----
-
-## 15. Bootstrap
-
-**Package:** `core/bootstrap.py`
-
-Seven-step first-launch sequence:
-
-| Step | Action |
-|---|---|
-| 1 | Detect hardware → `HardwareProfile` |
-| 2 | Install required Python packages via pip |
-| 3 | Install Ollama if not on PATH |
-| 4 | Pull primary language model |
-| 5 | Pull embedding model |
-| 6 | Create workspace directories under `~/.sentinel/` |
-| 7 | Build initial project index |
-
-On subsequent launches, presence of `~/.sentinel/.bootstrapped` skips all steps. Pass `--no-bootstrap` to skip unconditionally.
-
----
-
-## 16. Data Flow Diagram
+- CLI / entrypoint
+- Core services (routing, model routing, execution engine)
+- Agents (specialized actors such as `coding_agent`, `research_agent`)
+- Execution pipeline (dynamic, JSON-serialisable pipelines of steps)
+- Context engine (RAG, symbol graphs, file loaders)
+- Models (Ollama client and external model adapters)
+- Memory (conversation/session store and project indices)
+- Tools (encapsulated side-effectful operations)
 
 ```mermaid
-%%{init: {'theme': 'neutral', 'flowchart': {'curve': 'linear'}}}%%
 flowchart TD
-    U[User] --> UI[InteractiveUI]
-    UI --> SR[SentinelRuntime]
-    SR --> SUP[SupervisorAgent]
-    SR --> TP[TaskPlanner]
-    SR --> PG[PipelineGenerator]
-    SR --> OPT[LearningPipelineOptimizer]
-    OPT --> EE[ExecutionEngine]
-
-    EE <--> CB[ContextBuilder]
-    EE <--> MR[ModelRouter]
-    EE <--> AR[AgentRegistry]
-    EE <--> TR[ToolRegistry]
-    EE --> PT[PerformanceTracker]
-
-    classDef runtime fill:#e8f1ff,stroke:#1f4b99,color:#0f2c63,stroke-width:1px;
-    classDef exec fill:#e9f8ef,stroke:#1f7a45,color:#0d4d2a,stroke-width:1px;
-    classDef support fill:#fff5e8,stroke:#8a5a00,color:#5a3b00,stroke-width:1px;
-
-    class SR,SUP,TP,PG,OPT runtime;
-    class EE,AR,TR exec;
-    class CB,MR,PT,UI,U support;
+  subgraph User
+    U[User CLI / UI]
+  end
+  subgraph SentinelCore
+    CLI["CLI / Entry"] --> Router["Core Router / Supervisor"]
+    Router --> Planner["Planner / Pipeline Generator"]
+    Planner --> Execution["Execution Engine"]
+    Execution --> Tools["Tool Registry"]
+    Execution --> Models["Model Clients (Ollama)"]
+    Execution --> Context["Context Engine (RAG, loaders)"]
+    Memory["Memory / Session Store"] -.-> Execution
+    Context --> Memory
+    Models --> Memory
+  end
+  U --> CLI
 ```
+
+## Component details
+
+### CLI / Entry
+- `main.py` exposes the `sentinel` console script. CLI parsing and bootstrapping live here.
+- Responsibilities: parse args, determine project directory, set logging and telemetry, perform bootstrap checks.
+
+### Core Router & Supervisor
+- Handles incoming prompts and dispatches to appropriate agents.
+- Implements retry/fallback policies and high-level orchestration.
+
+### Agents
+- Agents are purpose-built actors with a common `BaseAgent` interface. Key agents:
+  - `CodingAgent`: code generation, patching files, refactors
+  - `DebuggingAgent`: reproduce failures, propose fixes
+  - `ResearchAgent`: external lookups and evidence gathering
+  - `SystemAgent`: OS operations, dependency installation
+  - `CriticAgent`: review and approval pass for important edits
+
+Agents accept `PipelineStep` objects and produce `AgentAction` outputs (tool calls, file edits, or responses).
+
+### Execution Engine
+- Converts a pipeline into ordered step execution, respecting dependencies and concurrency budgets.
+- For each step: build context, select model, invoke agent, apply resulting actions, record metrics.
+
+### Context Engine
+- Responsible for assembling compact, token-aware contexts for steps using RAG search, symbol graphs, and file excerpting.
+- Provides ranking heuristics and token-budget enforcement.
+
+### Model Clients
+- Primary local model integration is via Ollama HTTP client (see `models/ollama_client.py`).
+- A model registry maps logical model roles (e.g., `coding`, `reasoning`, `embed`) to concrete tags installed on the host.
+
+### Tools
+- Tools encapsulate side effects with schema-driven inputs (e.g., `read_file`, `write_file`, `run_shell`).
+- Tool invocations are validated, timed, and audited.
+
+### Memory
+- `memory/session_store.py` and `memory/conversation_memory.py` persist sessions and maintain an in-memory working buffer.
+
+## Data flows and lifecycle
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant CLI as CLI
+  participant S as Supervisor
+  participant P as Planner
+  participant E as ExecutionEngine
+  participant A as Agent
+  participant T as Tools
+  participant M as Models
+
+  U->>CLI: prompt
+  CLI->>S: submit(prompt)
+  S->>P: plan(goal)
+  P->>E: pipeline
+  E->>A: run(step)
+  A->>M: infer
+  A->>T: tool_call
+  T->>E: result
+  E->>S: pipeline result
+  S->>U: final response
+```
+
+## Runtime modes
+
+- `minimal`: constrained token budgets, smallest recommended models. (8–12 GB RAM)
+- `standard`: balanced tradeoff. (12–20 GB RAM)
+- `advanced`: high-capacity models and concurrency. (≥20 GB RAM or GPU)
+
+Hardware detection and recommended model selections are implemented in `system/hardware_detector.py` and `config/hardware_profile.py`.
+
+## Extension points
+
+- Add new `Tool` classes under `tools/` and register them in the tool registry.
+- Add new `Agent` subclasses under `agents/` and wire them into planner heuristics.
+- Implement new model adapters under `models/` for additional runtimes.
+
+## Where to look in code
+- `main.py` — startup and CLI
+- `agents/` — agent implementations
+- `core/` — supervisor, model router, execution engine
+- `execution/` — pipeline types and step runner
+- `context/` — RAG, loaders, symbol graph
+- `models/` — model clients and registry
+- `tools/` — all side-effectful operations
+
+## Key files and classes (developer map)
+
+This quick index helps contributors find the primary implementation points referenced in docs and tests:
+
+- `main.py` — application entrypoint; parses CLI flags and invokes bootstrap.
+- `agents/base_agent.py` — `BaseAgent` interface and common utilities.
+- `agents/coding_agent.py` — `CodingAgent` implementation for code edits and generation.
+- `agents/debugging_agent.py` — `DebuggingAgent` for test repro and patch proposals.
+- `core/execution_engine.py` — `ConcreteExecutionEngine` that drives `Pipeline` runs.
+- `core/model_router.py` — model selection heuristics (fallbacks, profiles).
+- `execution/pipeline.py` — `Pipeline` and `PipelineStep` types, JSON serialization.
+- `context/context_builder.py` — constructs per-step contexts from RAG, symbol graphs, and files.
+- `models/ollama_client.py` — HTTP client wrapper used to call local Ollama instances.
+- `memory/session_store.py` — session lifecycle and persistence.
+- `tools/` (many files) — `read_file`, `write_file`, `git_commit`, `run_shell`, etc.
+
+Consult these files when implementing features or debugging behavior; unit tests under `tests/` reference these modules directly.
+
+---
+
+This file is intentionally comprehensive; for API-level details consult the package-level docstrings and the tests under `tests/`.

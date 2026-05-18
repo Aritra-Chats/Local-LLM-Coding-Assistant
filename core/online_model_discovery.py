@@ -353,8 +353,12 @@ class OnlineModelDiscoveryEngine:
         self,
         domain: str,
         complexity: str,
-    ) -> Optional[Tuple[str, str]]:
-        """Return (model_base_tag, reason) for the highest-scoring cloud model.
+    ) -> List[Tuple[str, str]]:
+        """Return a ranked list of (model_base_tag, reason), best first.
+
+        Returns an empty list when no cloud client is configured or no models
+        are available. All scored models are returned so callers can walk the
+        list and skip unavailable models without an extra network call.
 
         Scoring layers (all derived at runtime from live API data + web search):
 
@@ -368,12 +372,12 @@ class OnlineModelDiscoveryEngine:
         from what the Ollama Cloud API returns and what current benchmarks say.
         """
         if self._cloud is None:
-            return None
+            return []
 
         available_models = self._get_cloud_models()
         available_tags   = self._cloud_model_tags()
         if not available_tags:
-            return None
+            return []
 
         # ── Apply task-specific model filtering ─────────────────────────────
         # For coding tasks, exclude very large models (>50B parameters)
@@ -443,25 +447,23 @@ class OnlineModelDiscoveryEngine:
             )
 
         if not combined:
-            return None
+            return []
 
-        best_tag   = max(combined, key=combined.__getitem__)
-        best_score = combined[best_tag]
-        best_base  = best_tag.replace(":cloud", "")
-
-        # Build a short explanation for the table display
-        meta_s   = metadata_scores.get(best_tag, 0.0)
-        search_s = search_scores.get(best_base, 0.0)
-        reason = (
-            f"runtime-scored for {domain}/{complexity} "
-            f"(meta={meta_s:.2f} web={search_s:.2f} total={best_score:.2f})"
-        )
-
-        # Note in reason if large models were filtered for coding tasks
-        if self._is_coding_task(domain):
-            reason += " [large models excluded for coding]"
-
-        return best_base, reason
+        ranked_tags = sorted(combined, key=combined.__getitem__, reverse=True)
+        result: List[Tuple[str, str]] = []
+        for tag in ranked_tags:
+            base     = tag.replace(":cloud", "")
+            score    = combined[tag]
+            meta_s   = metadata_scores.get(tag, 0.0)
+            search_s = search_scores.get(base, 0.0)
+            reason   = (
+                f"runtime-scored for {domain}/{complexity} "
+                f"(meta={meta_s:.2f} web={search_s:.2f} total={score:.2f})"
+            )
+            if self._is_coding_task(domain):
+                reason += " [large models excluded for coding]"
+            result.append((base, reason))
+        return result
 
     # ------------------------------------------------------------------
     # Decomposition model selector (≤250B cap)
@@ -624,14 +626,27 @@ class OnlineModelDiscoveryEngine:
         domain     = sub_task.get("routing_domain", sub_task.get("domain", "other"))
         complexity = sub_task.get("complexity", "medium")
 
-        # ── Priority 1: Ollama Cloud (scored) ─────────────────────────
-        cloud_result = self._select_ollama_cloud(domain, complexity)
-        if cloud_result:
-            tag, reason = cloud_result
+        # ── Priority 1: Ollama Cloud (scored, ranked) ──────────────────
+        cloud_candidates = self._select_ollama_cloud(domain, complexity)
+
+        available_tags_set = set(self._cloud_model_tags())
+        selected_cloud: Optional[Tuple[str, str]] = None
+        fallback_candidates: List[str] = []
+
+        for tag, reason in cloud_candidates:
+            if not available_tags_set or tag in available_tags_set:
+                if selected_cloud is None:
+                    selected_cloud = (tag, reason)
+                else:
+                    fallback_candidates.append(tag)
+
+        if selected_cloud:
+            tag, reason = selected_cloud
             sub_task["selected_model"] = {
-                "provider": "ollama_cloud",
-                "model":    tag,
-                "reason":   reason,
+                "provider":            "ollama_cloud",
+                "model":               tag,
+                "reason":              reason,
+                "cloud_fallback_list": fallback_candidates,
             }
             return sub_task
 

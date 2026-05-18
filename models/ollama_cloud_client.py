@@ -262,3 +262,31 @@ class OllamaCloudClient:
             return True  # If we got here without exception, it's available
         except Exception:
             return False
+
+    def is_model_available(self, model_tag: str) -> bool:
+        """Check that a specific model tag is accessible for inference.
+
+        ``is_available()`` only confirms the API key is valid; it cannot
+        detect tier-locked models that return 404 on ``/api/generate``.
+        This method makes a minimal single-token probe generate call to
+        verify the model is reachable on this plan.
+
+        Returns:
+            ``True`` if the model responds without a 404 / auth error.
+            ``False`` if the model is tier-locked, unknown, or unavailable.
+        """
+        tag = self._strip_cloud_suffix(model_tag)
+        body = {"model": tag, "prompt": "hi", "stream": False,
+                "options": {"num_predict": 1}}
+        try:
+            self._post("/api/generate", body, timeout=10)
+            return True
+        except RuntimeError as exc:
+            _msg = str(exc).lower()
+            # 404 means tier-locked or unknown model — not a transient error
+            if "404" in _msg or "not found" in _msg:
+                return False
+            # Other errors (timeout, 5xx) — treat as unavailable for safety
+            return False
+        except Exception:
+            return False
